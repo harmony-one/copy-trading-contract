@@ -6,15 +6,16 @@ import {Rebalancer} from "../src/Rebalancer.sol";
 
 contract DeployScript is Script {
     function run() external {
+        // Load required environment variables from .env file
         uint256 deployerPrivateKey = vm.envUint("PRIVATE_KEY");
         address deployer = vm.addr(deployerPrivateKey);
 
         console.log("Deploying Rebalancer contract...");
         console.log("Deployer address:", deployer);
 
-        // Get addresses from environment variables or use defaults for testing
-        address nftManager = vm.envOr("NFT_MANAGER_ADDRESS", address(0x1230000000000000000000000000000000000000));
-        address gauge = vm.envOr("GAUGE_ADDRESS", address(0x4560000000000000000000000000000000000000));
+        // Get addresses from environment variables (required for production deployment)
+        address nftManager = vm.envAddress("NFT_MANAGER_ADDRESS");
+        address gauge = vm.envAddress("GAUGE_ADDRESS");
         address owner = vm.envOr("OWNER_ADDRESS", deployer);
 
         console.log("NFT Manager:", nftManager);

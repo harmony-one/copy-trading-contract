@@ -57,30 +57,63 @@ forge test -vvv
 
 ### Deployment
 
-#### Local Network (Anvil)
+#### Setup Environment Variables
+
+Create a `.env` file in the project root with the following variables:
+
+```bash
+PRIVATE_KEY=your_private_key_here
+NFT_MANAGER_ADDRESS=0x...
+GAUGE_ADDRESS=0x...
+OWNER_ADDRESS=0x...  # optional, defaults to deployer address
+MAINNET_RPC_URL=https://...
+SEPOLIA_RPC_URL=https://...  # optional
+ETHERSCAN_API_KEY=your_api_key  # for verification
+```
+
+#### Easy Deployment Scripts
+
+Two deployment scripts are provided:
+
+**1. Basic Deployment (`deploy.sh`)**
+Simple deployment without integration tests:
+
+```bash
+./deploy.sh
+```
+
+**2. Deployment with Testing (`DeployAndTest.sh`)**
+Deployment with automatic integration testing:
+
+```bash
+./DeployAndTest.sh
+```
+
+Both scripts:
+- Automatically load variables from `.env` file
+- Detect network (Base/Mainnet/Sepolia) from RPC URL
+- Handle verification appropriately for each network
+- Provide clear instructions after deployment
+
+#### Manual Deployment
+
+##### Local Network (Anvil)
 
 1. Start a local node:
 ```bash
 anvil
 ```
 
-2. Configure environment variables (create a `.env` file):
-```bash
-PRIVATE_KEY=your_private_key_here
-NFT_MANAGER_ADDRESS=0x123...
-GAUGE_ADDRESS=0x456...
-OWNER_ADDRESS=0x789...
-```
-
-3. Load environment variables and deploy:
+2. Load environment variables and deploy:
 ```bash
 source .env
 forge script script/Deploy.s.sol:DeployScript --rpc-url anvil --broadcast
 ```
 
-#### Test Network (Sepolia)
+##### Test Network (Sepolia)
 
 ```bash
+source .env
 forge script script/Deploy.s.sol:DeployScript \
     --rpc-url $SEPOLIA_RPC_URL \
     --broadcast \
@@ -88,9 +121,10 @@ forge script script/Deploy.s.sol:DeployScript \
     -vvvv
 ```
 
-#### Main Network (Mainnet)
+##### Main Network (Mainnet)
 
 ```bash
+source .env
 forge script script/Deploy.s.sol:DeployScript \
     --rpc-url $MAINNET_RPC_URL \
     --broadcast \
@@ -98,42 +132,36 @@ forge script script/Deploy.s.sol:DeployScript \
     -vvvv
 ```
 
-### Deployment with Automatic Testing
+### Deployment Scripts Comparison
 
-#### DeployAndTest Script
+#### deploy.sh - Basic Deployment
+- Uses `script/Deploy.s.sol:DeployScript`
+- Quick deployment without integration tests
+- Faster for production deployments
+- Use when you just need to deploy quickly
 
-The `DeployAndTest.s.sol` script deploys the contract and then performs integration checks with real contracts:
+#### DeployAndTest.sh - Deployment with Testing
+- Uses `script/DeployAndTest.s.sol:DeployAndTestScript`
+- Deploys and runs integration tests
+- Verifies contract initialization and gauge integration
+- Use when you want to verify everything works after deployment
 
-```bash
-# Set up environment variables (NFT_MANAGER_ADDRESS and GAUGE_ADDRESS are required)
-export PRIVATE_KEY=your_private_key
-export NFT_MANAGER_ADDRESS=0x...
-export GAUGE_ADDRESS=0x...
-export MAINNET_RPC_URL=https://...
-
-# Deploy and test on Mainnet
-forge script script/DeployAndTest.s.sol:DeployAndTestScript \
-    --rpc-url $MAINNET_RPC_URL \
-    --broadcast \
-    --verify \
-    -vvvv
-```
-
-The script automatically checks:
+**Integration tests automatically check:**
 - Contract initialization
 - Token retrieval from gauge
 - ERC20 token balance checks
 - Current position check
 - Token metadata (symbols)
 
+**Note**: Both scripts read all values from `.env` file. Make sure `PRIVATE_KEY`, `NFT_MANAGER_ADDRESS`, and `GAUGE_ADDRESS` are set.
+
 ### Integration Tests with Real Contracts
 
 Run integration tests on a production network fork (without real transactions):
 
 ```bash
-# Set real contract addresses
-export NFT_MANAGER_ADDRESS=0x...
-export GAUGE_ADDRESS=0x...
+# Load .env
+source .env
 
 # Run integration tests on Mainnet fork
 forge test --match-contract RebalancerIntegrationTest \
@@ -158,13 +186,50 @@ Integration tests include:
 
 ### Contract Verification
 
+#### Automatic Verification
+
+Verification is attempted automatically during deployment. For Base network, auto-verification is skipped due to API V2 compatibility. After deployment, you'll see instructions for manual verification.
+
+#### Manual Verification
+
+Use the provided verification script:
+
 ```bash
+# Verify on Base network
+./verify.sh <CONTRACT_ADDRESS> base
+
+# Verify on Ethereum Mainnet
+./verify.sh <CONTRACT_ADDRESS> mainnet
+
+# Verify on Sepolia
+./verify.sh <CONTRACT_ADDRESS> sepolia
+```
+
+Or use forge directly:
+
+```bash
+# For Base network
+source .env
 forge verify-contract \
     <CONTRACT_ADDRESS> \
     src/Rebalancer.sol:Rebalancer \
+    --chain base \
+    --etherscan-api-key $BASESCAN_API_KEY \
+    --num-of-optimizations 200 \
+    --compiler-version 0.8.28
+
+# For Ethereum Mainnet/Sepolia
+source .env
+forge verify-contract \
+    <CONTRACT_ADDRESS> \
+    src/Rebalancer.sol:Rebalancer \
+    --chain mainnet \
     --etherscan-api-key $ETHERSCAN_API_KEY \
-    --chain sepolia
+    --num-of-optimizations 200 \
+    --compiler-version 0.8.28
 ```
+
+**Note:** The configuration uses Etherscan API V2 format. For Base network, make sure to set `BASESCAN_API_KEY` in your `.env` file.
 
 ## Configuration
 
