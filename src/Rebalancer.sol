@@ -37,17 +37,9 @@ contract Rebalancer is Ownable, ERC721Holder {
     }
 
     function rebalance(int24 tickLower, int24 tickUpper) external onlyOwner {
-        // Close existing positions first - wrap in try-catch to handle edge cases
+        // Close existing positions first
         if (currentTokenId != 0) {
-            try this.closeAllPositionsExternal() {}
-            catch {
-                // If closeAllPositions fails, manually reset and try to collect tokens
-                uint256 tokenId = currentTokenId;
-                currentTokenId = 0;
-                // Try one more collect attempt if NFT still exists
-                try nft.collect(INonfungiblePositionManager.CollectParams(tokenId, address(this), type(uint128).max, type(uint128).max)) {}
-                catch {}
-            }
+            _closeAllPositions();
         }
 
         IERC20 token0_ = token0();
@@ -105,42 +97,54 @@ contract Rebalancer is Ownable, ERC721Holder {
             uint256 tokenId = currentTokenId;
             currentTokenId = 0; // Reset before withdraw to prevent reentrancy
             
-            // Withdraw from gauge - this will:
-            // 1. Return the NFT to this contract
-            // 2. Collect fees and decrease liquidity internally
-            // 3. Return tokens to the position (which will be collected separately if needed)
+            // Step 1: Withdraw from gauge - this will:
+            // - Collect fees and send them to this contract (msg.sender)
+            // - Update staking in pool (decrease staked liquidity)
+            // - Return NFT to this contract via safeTransferFrom
+            // IMPORTANT: gauge.withdraw() does NOT decrease the position's liquidity itself!
             gauge.withdraw(tokenId);
             
-            // After withdraw, the NFT is owned by this contract
-            // Gauge may have already collected fees and decreased liquidity
-            // Try to collect any remaining fees (gauge may have collected everything already)
-            try nft.collect(INonfungiblePositionManager.CollectParams(tokenId, address(this), type(uint128).max, type(uint128).max)) {}
-            catch {
-                // If collect fails, gauge already collected everything - this is expected
+            // Step 2: Get current liquidity from the position
+            // After gauge.withdraw(), the NFT is owned by this contract but still has liquidity
+            (, , , , , , , uint128 currentLiquidity, , , , ) = nft.positions(tokenId);
+            
+            // Step 3: If position still has liquidity, decrease it completely
+            if (currentLiquidity > 0) {
+                // Decrease all remaining liquidity
+                nft.decreaseLiquidity(
+                    INonfungiblePositionManager.DecreaseLiquidityParams({
+                        tokenId: tokenId,
+                        liquidity: currentLiquidity, // Decrease all liquidity
+                        amount0Min: 0,
+                        amount1Min: 0,
+                        deadline: block.timestamp + 1 hours
+                    })
+                );
+                
+                // Collect tokens released from liquidity decrease
+                nft.collect(
+                    INonfungiblePositionManager.CollectParams({
+                        tokenId: tokenId,
+                        recipient: address(this),
+                        amount0Max: type(uint128).max,
+                        amount1Max: type(uint128).max
+                    })
+                );
             }
             
-            // Check if there's any remaining liquidity to decrease
-            // If gauge already decreased all liquidity, this will revert - handle it
-            try nft.decreaseLiquidity(INonfungiblePositionManager.DecreaseLiquidityParams(tokenId, type(uint128).max, 0, 0, block.timestamp + 1 hours)) {
-                // If decrease succeeded, try to collect the released tokens
-                // Note: gauge may have already collected these, so this might also fail
-                try nft.collect(INonfungiblePositionManager.CollectParams(tokenId, address(this), type(uint128).max, type(uint128).max)) {}
-                catch {}
-            } catch {
-                // If decreaseLiquidity fails, liquidity was already decreased by gauge
-                // This is expected behavior - gauge.withdraw() already handled it
-            }
+            // Step 4: Final collect to ensure all fees and tokens are collected
+            try nft.collect(
+                INonfungiblePositionManager.CollectParams({
+                    tokenId: tokenId,
+                    recipient: address(this),
+                    amount0Max: type(uint128).max,
+                    amount1Max: type(uint128).max
+                })
+            ) {} catch {}
             
-            // Burn the NFT - this removes the position from the protocol
-            // After gauge.withdraw(), the NFT should be owned by this contract
-            // If burn fails with "NC", it means position still has liquidity or uncollected fees
-            // Try to burn - if it fails, position might have been fully cleared by gauge
-            try nft.burn(tokenId) {}
-            catch {
-                // If burn fails, gauge may have already cleared the position
-                // This is unusual but possible - the NFT might not exist or be burnable
-                // In this case, we've already reset currentTokenId, so we can continue
-            }
+            // Step 5: Burn the NFT - now position should be empty
+            // burn() requires position to have zero liquidity and all tokens collected
+            nft.burn(tokenId);
         }
     }
 

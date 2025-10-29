@@ -80,6 +80,30 @@ contract MockNFTManager is INonfungiblePositionManager {
     function burn(uint256 tokenId) external override {}
 
     function approve(address spender, uint256 tokenId) external override {}
+    
+    // Mock positions function - returns zero liquidity for testing
+    function positions(uint256 tokenId)
+        external
+        pure
+        override
+        returns (
+            uint96,
+            address,
+            address,
+            address,
+            int24,
+            int24,
+            int24,
+            uint128 liquidity,
+            uint256,
+            uint256,
+            uint128,
+            uint128
+        )
+    {
+        // Return zero liquidity so tests can pass
+        return (0, address(0), address(0), address(0), 0, 0, 0, 0, 0, 0, 0, 0);
+    }
 }
 
 contract MockGauge {

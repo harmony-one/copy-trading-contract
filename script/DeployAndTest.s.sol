@@ -200,12 +200,12 @@ contract DeployAndTestScript is Script {
             require(deployerBalance1 >= amount1, "Insufficient Token1 balance");
         }
         
-        // Step 1: Approve tokens (approve enough for both deposits and operations)
+        // Step 1: Approve tokens
         {
             console.log("\n[Step 1] Approving tokens...");
-            // Approve double amount to ensure we have enough for two rebalances
-            require(token0_.approve(rebalancerAddr, amount0 * 2), "Token0 approval failed");
-            require(token1_.approve(rebalancerAddr, amount1 * 2), "Token1 approval failed");
+            // Approve sufficient amount for operations (fees may be collected, so approve more than needed)
+            require(token0_.approve(rebalancerAddr, amount0 * 3), "Token0 approval failed");
+            require(token1_.approve(rebalancerAddr, amount1 * 3), "Token1 approval failed");
             console.log("[OK] Tokens approved");
         }
         
@@ -238,17 +238,13 @@ contract DeployAndTestScript is Script {
         // Step 4: Second Rebalance (will close first position and create new one)
         {
             console.log("\n[Step 4] Second Rebalance (rebalancing existing position)...");
-            console.log("  TokenId before second rebalance:", rebalancer_.currentTokenId());
+            uint256 tokenId1 = rebalancer_.currentTokenId();
+            console.log("  TokenId before second rebalance:", tokenId1);
             {
                 uint256 bal0 = token0_.balanceOf(rebalancerAddr);
                 uint256 bal1 = token1_.balanceOf(rebalancerAddr);
                 console.log("  Contract Token0 balance before:", bal0);
                 console.log("  Contract Token1 balance before:", bal1);
-                // If balances are too low, deposit more tokens
-                if (bal0 < amount0 / 2 || bal1 < amount1 / 2) {
-                    console.log("  Depositing additional tokens for second rebalance...");
-                    rebalancer_.deposit(amount0, amount1);
-                }
             }
             
             // Rebalance will close the first position and create a new one
@@ -256,10 +252,12 @@ contract DeployAndTestScript is Script {
             
             uint256 tokenId2 = rebalancer_.currentTokenId();
             require(tokenId2 != 0, "Second rebalance failed: tokenId is zero");
+            // Verify that a new position was created (tokenId should be different from the first one)
+            require(tokenId2 != tokenId1, "Second rebalance should create new position with different tokenId");
             console.log("  TokenId after second rebalance:", tokenId2);
             console.log("  Contract Token0 balance after:", token0_.balanceOf(rebalancerAddr));
             console.log("  Contract Token1 balance after:", token1_.balanceOf(rebalancerAddr));
-            console.log("[OK] Second rebalance completed, new position created");
+            console.log("[OK] Second rebalance completed, new position created (first position closed)");
         }
         
         // Step 5: Close all positions
