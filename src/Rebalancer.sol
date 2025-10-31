@@ -29,6 +29,10 @@ contract Rebalancer is Ownable, ERC721Holder {
         return gauge.tickSpacing();
     }
 
+    function rewardToken() public view returns (IERC20) {
+        return IERC20(gauge.rewardToken());
+    }
+
     function deposit(uint256 amount0, uint256 amount1) external onlyOwner {
         IERC20 token0_ = token0();
         IERC20 token1_ = token1();
@@ -153,6 +157,14 @@ contract Rebalancer is Ownable, ERC721Holder {
         IERC20 token1_ = token1();
         require(token0_.transfer(owner(), token0_.balanceOf(address(this))), "withdraw token0 failed");
         require(token1_.transfer(owner(), token1_.balanceOf(address(this))), "withdraw token1 failed");
+    }
+
+    /// @notice Withdraw all AERO reward tokens to owner
+    /// @dev Gets the reward token address from the gauge contract and transfers all balance to owner
+    function withdrawRewards() external onlyOwner {
+        IERC20 rewardToken_ = rewardToken();
+        uint256 balance = rewardToken_.balanceOf(address(this));
+        require(rewardToken_.transfer(owner(), balance), "withdraw rewards failed");
     }
 
     function rescueERC20(address token, address to, uint256 amount) external onlyOwner {

@@ -128,6 +128,24 @@ contract DeployAndTestScript is Script {
             console.log("[WARN] Token1 symbol not available");
         }
 
+        // Check 6: Reward token check
+        console.log("\n[Test 6] Checking reward token...");
+        address rewardTokenAddr = gauge_.rewardToken();
+        require(rewardTokenAddr != address(0), "Reward token address is zero");
+        
+        address rebalancerRewardToken = address(rebalancer_.rewardToken());
+        require(rebalancerRewardToken == rewardTokenAddr, "Rebalancer reward token mismatch with gauge");
+        
+        console.log("[OK] Reward token:", rewardTokenAddr);
+        try this.getTokenSymbol(rewardTokenAddr) returns (string memory symbol) {
+            console.log("[OK] Reward token symbol:", symbol);
+        } catch {
+            console.log("[WARN] Reward token symbol not available");
+        }
+        
+        uint256 rewardBalance = IERC20(rewardTokenAddr).balanceOf(address(rebalancer_));
+        console.log("[OK] Reward token balance in Rebalancer:", rewardBalance);
+
         console.log("\n=== All Integration Tests Passed! ===");
     }
 
@@ -294,6 +312,39 @@ contract DeployAndTestScript is Script {
             require(token0_.balanceOf(rebalancerAddr) == 0, "Contract should have no Token0");
             require(token1_.balanceOf(rebalancerAddr) == 0, "Contract should have no Token1");
             console.log("[OK] Withdraw completed");
+        }
+        
+        // Step 7: Withdraw reward tokens (AERO)
+        {
+            console.log("\n[Step 7] Withdrawing reward tokens (AERO)...");
+            address owner = rebalancer_.owner();
+            IERC20 rewardToken_ = rebalancer_.rewardToken();
+            
+            uint256 rewardBalanceBefore = rewardToken_.balanceOf(rebalancerAddr);
+            uint256 ownerRewardBalanceBefore = rewardToken_.balanceOf(owner);
+            
+            console.log("  Contract reward token balance before:", rewardBalanceBefore);
+            console.log("  Owner reward token balance before:", ownerRewardBalanceBefore);
+            console.log("  Reward token address:", address(rewardToken_));
+            
+            if (rewardBalanceBefore > 0) {
+                rebalancer_.withdrawRewards();
+                
+                uint256 rewardBalanceAfter = rewardToken_.balanceOf(rebalancerAddr);
+                uint256 ownerRewardBalanceAfter = rewardToken_.balanceOf(owner);
+                
+                console.log("  Contract reward token balance after:", rewardBalanceAfter);
+                console.log("  Owner reward token balance after:", ownerRewardBalanceAfter);
+                
+                require(rewardBalanceAfter == 0, "Contract should have no reward tokens after withdrawal");
+                require(ownerRewardBalanceAfter == ownerRewardBalanceBefore + rewardBalanceBefore, "Reward tokens not transferred correctly");
+                console.log("[OK] Reward tokens withdrawn successfully");
+            } else {
+                console.log("  No reward tokens to withdraw (balance is zero)");
+                // Even with zero balance, withdrawRewards should work
+                rebalancer_.withdrawRewards();
+                console.log("[OK] withdrawRewards() executed successfully with zero balance");
+            }
         }
         
         console.log("\n=== Full Flow Tests Completed Successfully! ===");

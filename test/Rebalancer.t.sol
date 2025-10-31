@@ -111,11 +111,13 @@ contract MockGauge {
     address public token0;
     address public token1;
     int24 public tickSpacing;
+    address public rewardToken;
 
-    constructor(address _token0, address _token1, int24 _tickSpacing) {
+    constructor(address _token0, address _token1, int24 _tickSpacing, address _rewardToken) {
         token0 = _token0;
         token1 = _token1;
         tickSpacing = _tickSpacing;
+        rewardToken = _rewardToken;
     }
 
     function deposit(uint256 tokenId) external {
@@ -131,6 +133,7 @@ contract RebalancerTest is Test {
     Rebalancer public rebalancer;
     MockERC20 public token0;
     MockERC20 public token1;
+    MockERC20 public rewardToken;
     MockNFTManager public nftManager;
     MockGauge public gauge;
     address public owner;
@@ -142,8 +145,9 @@ contract RebalancerTest is Test {
 
         token0 = new MockERC20("Token0", "TKN0");
         token1 = new MockERC20("Token1", "TKN1");
+        rewardToken = new MockERC20("AERO", "AERO");
         nftManager = new MockNFTManager();
-        gauge = new MockGauge(address(token0), address(token1), 60);
+        gauge = new MockGauge(address(token0), address(token1), 60, address(rewardToken));
 
         rebalancer = new Rebalancer(address(nftManager), address(gauge), owner);
     }
@@ -155,6 +159,7 @@ contract RebalancerTest is Test {
         assertEq(address(rebalancer.token0()), address(token0));
         assertEq(address(rebalancer.token1()), address(token1));
         assertEq(rebalancer.tickSpacing(), 60);
+        assertEq(address(rebalancer.rewardToken()), address(rewardToken));
     }
 
     function testDeposit() public {
@@ -264,6 +269,88 @@ contract RebalancerTest is Test {
 
         assertEq(randomToken.balanceOf(owner), amount);
         assertEq(randomToken.balanceOf(address(rebalancer)), 0);
+    }
+
+    function testRewardToken() public {
+        // Test that rewardToken() returns the correct address from gauge
+        assertEq(address(rebalancer.rewardToken()), address(rewardToken));
+        assertEq(address(rebalancer.rewardToken()), gauge.rewardToken());
+    }
+
+    function testWithdrawRewards() public {
+        uint256 rewardAmount = 1000e18;
+
+        // Mint reward tokens to the rebalancer contract
+        rewardToken.mint(address(rebalancer), rewardAmount);
+
+        uint256 ownerBalanceBefore = rewardToken.balanceOf(owner);
+        uint256 contractBalanceBefore = rewardToken.balanceOf(address(rebalancer));
+
+        assertEq(contractBalanceBefore, rewardAmount);
+        assertEq(ownerBalanceBefore, 0);
+
+        // Withdraw rewards
+        rebalancer.withdrawRewards();
+
+        // Verify tokens were transferred to owner
+        assertEq(rewardToken.balanceOf(owner), ownerBalanceBefore + rewardAmount);
+        assertEq(rewardToken.balanceOf(address(rebalancer)), 0);
+    }
+
+    function testWithdrawRewardsWithZeroBalance() public {
+        // Test that withdrawRewards works even with zero balance
+        uint256 ownerBalanceBefore = rewardToken.balanceOf(owner);
+        assertEq(rewardToken.balanceOf(address(rebalancer)), 0);
+
+        // Should not revert even with zero balance
+        rebalancer.withdrawRewards();
+
+        // Balance should remain the same
+        assertEq(rewardToken.balanceOf(owner), ownerBalanceBefore);
+        assertEq(rewardToken.balanceOf(address(rebalancer)), 0);
+    }
+
+    function testWithdrawRewardsRevertsIfNotOwner() public {
+        uint256 rewardAmount = 1000e18;
+        rewardToken.mint(address(rebalancer), rewardAmount);
+
+        vm.prank(user);
+        vm.expectRevert();
+        rebalancer.withdrawRewards();
+    }
+
+    function testRebalanceClosesPreviousPosition() public {
+        uint256 amount0 = 1000e18;
+        uint256 amount1 = 2000e18;
+
+        token0.mint(owner, amount0);
+        token1.mint(owner, amount1);
+
+        token0.approve(address(rebalancer), amount0);
+        token1.approve(address(rebalancer), amount1);
+
+        rebalancer.deposit(amount0, amount1);
+
+        int24 tickLower = -1000;
+        int24 tickUpper = 1000;
+
+        // First rebalance creates position
+        rebalancer.rebalance(tickLower, tickUpper);
+        uint256 tokenId1 = rebalancer.currentTokenId();
+        assertEq(tokenId1, 1);
+
+        // Second rebalance should close first position and create new one
+        // We need to ensure there are still tokens in the contract
+        // In a real scenario, closing position would return tokens
+        // For mock, we'll add more tokens before second rebalance
+        token0.mint(address(rebalancer), amount0 / 10);
+        token1.mint(address(rebalancer), amount1 / 10);
+
+        rebalancer.rebalance(tickLower, tickUpper);
+        uint256 tokenId2 = rebalancer.currentTokenId();
+        
+        // Should create a new position (different tokenId)
+        assertTrue(tokenId2 != tokenId1 || tokenId2 == 2);
     }
 }
 
