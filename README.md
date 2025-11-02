@@ -14,7 +14,11 @@ A Foundry project for the Rebalancer contract with build, testing, and deploymen
 │       └── RebalancerIntegration.t.sol      # Tests with real contracts
 ├── script/           # Deployment scripts
 │   ├── Deploy.s.sol          # Basic deployment script
-│   └── DeployAndTest.s.sol   # Deployment script with integration tests
+│   ├── DeployAndTest.s.sol   # Deployment script with integration tests
+│   └── CloseAndWithdraw.s.sol # Close positions and withdraw script
+├── deploy.sh         # Basic deployment script
+├── DeployAndTest.sh  # Deployment with testing script
+└── closeAndWithdraw.sh # Close and withdraw operations script
 ├── lib/              # Dependencies (OpenZeppelin, etc.)
 └── foundry.toml      # Foundry configuration
 ```
@@ -154,6 +158,41 @@ forge script script/Deploy.s.sol:DeployScript \
 - Token metadata (symbols)
 
 **Note**: Both scripts read all values from `.env` file. Make sure `PRIVATE_KEY`, `NFT_MANAGER_ADDRESS`, and `GAUGE_ADDRESS` are set.
+
+#### Close and Withdraw Script (`closeAndWithdraw.sh`)
+
+Script to close all positions and withdraw all tokens and rewards from an existing Rebalancer contract:
+
+```bash
+./closeAndWithdraw.sh <REBALANCER_CONTRACT_ADDRESS>
+```
+
+**Example:**
+```bash
+./closeAndWithdraw.sh 0x1234567890123456789012345678901234567890
+```
+
+**What it does:**
+1. **Close All Positions**: Closes all active Uniswap V3 positions
+   - Withdraws positions from gauge
+   - Decreases liquidity
+   - Collects all tokens and fees
+   - Burns the NFT position
+
+2. **Withdraw All Tokens**: Withdraws all Token0 and Token1 to the owner
+   - Transfers all Token0 balance to owner
+   - Transfers all Token1 balance to owner
+
+3. **Withdraw Rewards**: Withdraws all AERO reward tokens to the owner
+   - Gets reward token address from gauge
+   - Transfers all reward token balance to owner
+
+**Requirements:**
+- `PRIVATE_KEY` in `.env` must be the owner of the contract
+- `MAINNET_RPC_URL` or `SEPOLIA_RPC_URL` must be set in `.env`
+- Valid contract address as parameter
+
+**Note**: The script validates that the deployer (from `PRIVATE_KEY`) is the owner of the contract before executing any operations.
 
 ### Integration Tests with Real Contracts
 
