@@ -210,20 +210,56 @@ contract DeployAndTestScript is Script {
             console.log("\n[Step 0] Checking initial balances...");
             uint256 deployerBalance0 = token0_.balanceOf(deployer);
             uint256 deployerBalance1 = token1_.balanceOf(deployer);
+            console.log("  Required Token0 amount:", amount0);
+            console.log("  Required Token1 amount:", amount1);
             console.log("  Deployer Token0 balance:", deployerBalance0);
             console.log("  Deployer Token1 balance:", deployerBalance1);
             console.log("  Contract Token0 balance:", token0_.balanceOf(rebalancerAddr));
             console.log("  Contract Token1 balance:", token1_.balanceOf(rebalancerAddr));
-            require(deployerBalance0 >= amount0, "Insufficient Token0 balance");
-            require(deployerBalance1 >= amount1, "Insufficient Token1 balance");
+            
+            // Check if we have at least one token (contract can work with single token)
+            bool hasToken0 = deployerBalance0 >= amount0;
+            bool hasToken1 = deployerBalance1 >= amount1;
+            
+            if (!hasToken0 && !hasToken1) {
+                console.log("  [ERROR] Insufficient balances for both tokens!");
+                console.log("    Need Token0:", amount0, "Have:", deployerBalance0);
+                console.log("    Need Token1:", amount1, "Have:", deployerBalance1);
+                revert("Insufficient balances: need at least one token (Token0 or Token1) to proceed");
+            }
+            
+            if (!hasToken0) {
+                console.log("  [WARN] Insufficient Token0 balance - will test with Token1 only");
+                console.log("    Need Token0:", amount0, "Have:", deployerBalance0);
+                amount0 = 0; // Set to zero to allow single token test
+            }
+            
+            if (!hasToken1) {
+                console.log("  [WARN] Insufficient Token1 balance - will test with Token0 only");
+                console.log("    Need Token1:", amount1, "Have:", deployerBalance1);
+                amount1 = 0; // Set to zero to allow single token test
+            }
+            
+            if (hasToken0 && hasToken1) {
+                console.log("  [OK] Sufficient balances for both tokens");
+            } else {
+                console.log("  [INFO] Will proceed with single token test (as supported by rebalance function)");
+            }
         }
         
         // Step 1: Approve tokens
         {
             console.log("\n[Step 1] Approving tokens...");
             // Approve sufficient amount for operations (fees may be collected, so approve more than needed)
-            require(token0_.approve(rebalancerAddr, amount0 * 3), "Token0 approval failed");
-            require(token1_.approve(rebalancerAddr, amount1 * 3), "Token1 approval failed");
+            // Only approve if amount > 0 (allows single token operation)
+            if (amount0 > 0) {
+                require(token0_.approve(rebalancerAddr, amount0 * 3), "Token0 approval failed");
+                console.log("  Token0 approved:", amount0 * 3);
+            }
+            if (amount1 > 0) {
+                require(token1_.approve(rebalancerAddr, amount1 * 3), "Token1 approval failed");
+                console.log("  Token1 approved:", amount1 * 3);
+            }
             console.log("[OK] Tokens approved");
         }
         
@@ -235,8 +271,14 @@ contract DeployAndTestScript is Script {
             uint256 balance1 = token1_.balanceOf(rebalancerAddr);
             console.log("  Contract Token0 balance after deposit:", balance0);
             console.log("  Contract Token1 balance after deposit:", balance1);
-            require(balance0 >= amount0, "Token0 deposit failed");
-            require(balance1 >= amount1, "Token1 deposit failed");
+            
+            // Check deposits - allow zero amounts for single token operations
+            if (amount0 > 0) {
+                require(balance0 >= amount0, "Token0 deposit failed");
+            }
+            if (amount1 > 0) {
+                require(balance1 >= amount1, "Token1 deposit failed");
+            }
             console.log("[OK] Deposit completed");
         }
         
@@ -244,37 +286,120 @@ contract DeployAndTestScript is Script {
         {
             console.log("\n[Step 3] First Rebalance (creating position)...");
             console.log("  TokenId before rebalance:", rebalancer_.currentTokenId());
+            
+            uint256 balance0Before = token0_.balanceOf(rebalancerAddr);
+            uint256 balance1Before = token1_.balanceOf(rebalancerAddr);
+            console.log("  Contract Token0 balance before rebalance:", balance0Before);
+            console.log("  Contract Token1 balance before rebalance:", balance1Before);
+            
             rebalancer_.rebalance(tickLower, tickUpper);
+            
             uint256 tokenId1 = rebalancer_.currentTokenId();
             require(tokenId1 != 0, "First rebalance failed: tokenId is zero");
             console.log("  TokenId after first rebalance:", tokenId1);
-            console.log("  Contract Token0 balance:", token0_.balanceOf(rebalancerAddr));
-            console.log("  Contract Token1 balance:", token1_.balanceOf(rebalancerAddr));
+            
+            uint256 balance0After = token0_.balanceOf(rebalancerAddr);
+            uint256 balance1After = token1_.balanceOf(rebalancerAddr);
+            console.log("  Contract Token0 balance after rebalance:", balance0After);
+            console.log("  Contract Token1 balance after rebalance:", balance1After);
+            
+            // Check that most tokens were used (allow small remainder for rounding/approximation)
+            // Typically, if price is within range, both tokens should be mostly used
+            // If price is outside range, one token should be fully used, other may remain
+            // We allow up to 1% remainder or 1000 wei (whichever is larger) for rounding errors
+            uint256 threshold0 = balance0Before / 100 > 1000 ? balance0Before / 100 : 1000;
+            uint256 threshold1 = balance1Before / 100 > 1000 ? balance1Before / 100 : 1000;
+            
+            bool token0UsedWell = balance0After <= threshold0 || balance0Before == 0;
+            bool token1UsedWell = balance1After <= threshold1 || balance1Before == 0;
+            
+            // At least one token should be well utilized (or both if price is in range)
+            require(token0UsedWell || token1UsedWell, 
+                "Balance utilization check failed: significant amounts of both tokens remain unused");
+            
+            uint256 utilization0 = balance0Before > 0 && balance0After < balance0Before 
+                ? ((balance0Before - balance0After) * 100) / balance0Before 
+                : 0;
+            uint256 utilization1 = balance1Before > 0 && balance1After < balance1Before 
+                ? ((balance1Before - balance1After) * 100) / balance1Before 
+                : 0;
+            
+            console.log("  Token0 utilization: % used, % remaining", utilization0, balance0After);
+            console.log("  Token1 utilization: % used, % remaining", utilization1, balance1After);
+            
+            if (balance0After > threshold0 && balance1After > threshold1) {
+                console.log("  [WARN] Both tokens have significant remainders - price may be outside tick range");
+            } else {
+                console.log("  [OK] Balance utilization is acceptable");
+            }
+            
             console.log("[OK] First rebalance completed, position created");
         }
         
         // Step 4: Second Rebalance (will close first position and create new one)
         {
             console.log("\n[Step 4] Second Rebalance (rebalancing existing position)...");
-            uint256 tokenId1 = rebalancer_.currentTokenId();
-            console.log("  TokenId before second rebalance:", tokenId1);
+            uint256 tokenId1;
+            uint256 balance0Before;
+            uint256 balance1Before;
             {
-                uint256 bal0 = token0_.balanceOf(rebalancerAddr);
-                uint256 bal1 = token1_.balanceOf(rebalancerAddr);
-                console.log("  Contract Token0 balance before:", bal0);
-                console.log("  Contract Token1 balance before:", bal1);
+                tokenId1 = rebalancer_.currentTokenId();
+                console.log("  TokenId before second rebalance:", tokenId1);
+                
+                balance0Before = token0_.balanceOf(rebalancerAddr);
+                balance1Before = token1_.balanceOf(rebalancerAddr);
+                console.log("  Contract Token0 balance before:", balance0Before);
+                console.log("  Contract Token1 balance before:", balance1Before);
             }
             
             // Rebalance will close the first position and create a new one
             rebalancer_.rebalance(tickLower, tickUpper);
             
-            uint256 tokenId2 = rebalancer_.currentTokenId();
-            require(tokenId2 != 0, "Second rebalance failed: tokenId is zero");
-            // Verify that a new position was created (tokenId should be different from the first one)
-            require(tokenId2 != tokenId1, "Second rebalance should create new position with different tokenId");
-            console.log("  TokenId after second rebalance:", tokenId2);
-            console.log("  Contract Token0 balance after:", token0_.balanceOf(rebalancerAddr));
-            console.log("  Contract Token1 balance after:", token1_.balanceOf(rebalancerAddr));
+            {
+                uint256 tokenId2 = rebalancer_.currentTokenId();
+                require(tokenId2 != 0, "Second rebalance failed: tokenId is zero");
+                // Verify that a new position was created (tokenId should be different from the first one)
+                require(tokenId2 != tokenId1, "Second rebalance should create new position with different tokenId");
+                console.log("  TokenId after second rebalance:", tokenId2);
+            }
+            
+            {
+                uint256 balance0After = token0_.balanceOf(rebalancerAddr);
+                uint256 balance1After = token1_.balanceOf(rebalancerAddr);
+                console.log("  Contract Token0 balance after:", balance0After);
+                console.log("  Contract Token1 balance after:", balance1After);
+                
+                // After closing the first position and creating new one, we should have:
+                // 1. Tokens from closed position collected
+                // 2. Most tokens should be used in the new position
+                // Check utilization after second rebalance
+                uint256 threshold0 = balance0Before / 100 > 1000 ? balance0Before / 100 : 1000;
+                uint256 threshold1 = balance1Before / 100 > 1000 ? balance1Before / 100 : 1000;
+                
+                bool token0UsedWell = balance0After <= threshold0 || balance0Before == 0;
+                bool token1UsedWell = balance1After <= threshold1 || balance1Before == 0;
+                
+                // At least one token should be well utilized
+                require(token0UsedWell || token1UsedWell, 
+                    "Balance utilization check failed after second rebalance: significant amounts of both tokens remain unused");
+                
+                uint256 utilization0 = balance0Before > 0 && balance0After < balance0Before 
+                    ? ((balance0Before - balance0After) * 100) / balance0Before 
+                    : 0;
+                uint256 utilization1 = balance1Before > 0 && balance1After < balance1Before 
+                    ? ((balance1Before - balance1After) * 100) / balance1Before 
+                    : 0;
+                
+                console.log("  Token0 utilization: % used, % remaining", utilization0, balance0After);
+                console.log("  Token1 utilization: % used, % remaining", utilization1, balance1After);
+                
+                if (balance0After > threshold0 && balance1After > threshold1) {
+                    console.log("  [WARN] Both tokens have significant remainders after second rebalance");
+                } else {
+                    console.log("  [OK] Balance utilization after second rebalance is acceptable");
+                }
+            }
+            
             console.log("[OK] Second rebalance completed, new position created (first position closed)");
         }
         

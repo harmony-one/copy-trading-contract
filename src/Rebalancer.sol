@@ -12,6 +12,12 @@ contract Rebalancer is Ownable, ERC721Holder {
     ICLGauge public gauge;
     uint256 public currentTokenId;
 
+    // Events for error logging
+    event RebalanceError(string operation, bytes reason);
+    event IncreaseLiquidityError(bytes reason);
+    event MintError(bytes reason);
+    event CollectError(bytes reason);
+
     constructor(address _nft, address _gauge, address _owner) Ownable(_owner) {
         nft = INonfungiblePositionManager(_nft);
         gauge = ICLGauge(_gauge);
@@ -51,15 +57,23 @@ contract Rebalancer is Ownable, ERC721Holder {
         uint256 amount0 = token0_.balanceOf(address(this));
         uint256 amount1 = token1_.balanceOf(address(this));
 
-        // Skip creating new position if balances are too low
-        // This can happen if position was closed but fees were minimal
+        // Skip creating new position only if both tokens are zero
+        // Uniswap V3 can create positions with just one token if price is outside tick range:
+        // - If price > tickUpper: only token0 is needed
+        // - If price < tickLower: only token1 is needed
+        // - If price is within range: both tokens are needed (proportional to current price)
         if (amount0 == 0 && amount1 == 0) {
             return; // No tokens to create position with
         }
 
         // Approve tokens for NFT Manager before minting
-        token0_.approve(address(nft), amount0);
-        token1_.approve(address(nft), amount1);
+        // It's safe to approve zero amounts - ERC20 approve handles this
+        if (amount0 > 0) {
+            token0_.approve(address(nft), amount0);
+        }
+        if (amount1 > 0) {
+            token1_.approve(address(nft), amount1);
+        }
 
         INonfungiblePositionManager.MintParams memory params = INonfungiblePositionManager.MintParams({
             token0: address(token0_),
@@ -77,13 +91,69 @@ contract Rebalancer is Ownable, ERC721Holder {
         });
 
         // Try to mint new position - if it fails, we'll skip it
-        try nft.mint(params) returns (uint256 tokenId, uint128, uint256, uint256) {
+        try nft.mint(params) returns (uint256 tokenId, uint128 liquidity, uint256 amount0Used, uint256 amount1Used) {
             currentTokenId = tokenId;
+            
+            // Check if there are unused tokens remaining
+            // Uniswap V3 mint may use less than desired amounts if price is outside tick range
+            // or if proportions don't match the current pool price
+            // When one token is zero, only the other will be used (if price allows)
+            uint256 amount0Remaining = amount0 > amount0Used ? amount0 - amount0Used : 0;
+            uint256 amount1Remaining = amount1 > amount1Used ? amount1 - amount1Used : 0;
+            
+            // CRITICAL: increaseLiquidity must be called BEFORE depositing to gauge!
+            // According to NonfungiblePositionManager reference implementation:
+            // - If position is staked (owned by gauge), only gauge can call increaseLiquidity
+            // - We must add remaining liquidity while we still own the NFT (before gauge.deposit)
+            // - After deposit, the NFT ownership transfers to gauge and we cannot modify it directly
+            if ((amount0Remaining > 0 || amount1Remaining > 0) && liquidity > 0) {
+                // Approve remaining tokens for increaseLiquidity
+                if (amount0Remaining > 0) {
+                    token0_.approve(address(nft), amount0Remaining);
+                }
+                if (amount1Remaining > 0) {
+                    token1_.approve(address(nft), amount1Remaining);
+                }
+                
+                // Add remaining liquidity BEFORE depositing to gauge
+                // This ensures we can use all available tokens while we own the position
+                try nft.increaseLiquidity(
+                    INonfungiblePositionManager.IncreaseLiquidityParams({
+                        tokenId: tokenId,
+                        amount0Desired: amount0Remaining,
+                        amount1Desired: amount1Remaining,
+                        amount0Min: 0,
+                        amount1Min: 0,
+                        deadline: block.timestamp + 1 hours
+                    })
+                ) returns (uint128, uint256, uint256) {
+                    // Successfully added remaining liquidity
+                    // Now all available tokens are used in the position
+                } catch (bytes memory reason) {
+                    // If increaseLiquidity fails, remaining tokens will stay in contract
+                    // They can be withdrawn later or used in next rebalance
+                    // This is especially useful when one token has run out - we can continue
+                    // rebalancing with the remaining token
+                    emit IncreaseLiquidityError(reason);
+                }
+            }
+            
+            // Approve and deposit to gauge AFTER increasing liquidity
+            // Once deposited, the gauge owns the NFT and we cannot modify it directly
+            // If we need to increase liquidity later, we'd need to withdraw first
             nft.approve(address(gauge), tokenId);
             gauge.deposit(tokenId);
-        } catch {
-            // If mint fails (e.g., too little liquidity), skip creating new position
-            // This can happen if balances are too low after closing previous position
+        } catch (bytes memory reason) {
+            // If mint fails, it could be due to:
+            // 1. Insufficient liquidity in the pool for the tick range
+            // 2. Invalid tick range
+            // 3. Both tokens are zero (shouldn't reach here due to early return)
+            // 4. Price movement makes the position impossible to create
+            // 5. Amount is too small (even with one token, minimum liquidity requirements may not be met)
+            // In any case, we skip creating new position and keep currentTokenId as 0
+            // This allows the contract to continue operating - tokens remain in contract
+            // and can be used in next rebalance when more tokens are available
+            emit MintError(reason);
             currentTokenId = 0;
         }
     }
@@ -144,11 +214,15 @@ contract Rebalancer is Ownable, ERC721Holder {
                     amount0Max: type(uint128).max,
                     amount1Max: type(uint128).max
                 })
-            ) {} catch {}
+            ) {} catch (bytes memory reason) {
+                emit CollectError(reason);
+            }
             
             // Step 5: Burn the NFT - now position should be empty
             // burn() requires position to have zero liquidity and all tokens collected
-            nft.burn(tokenId);
+            try nft.burn(tokenId) {} catch (bytes memory reason) {
+                emit RebalanceError("burn", reason);
+            }
         }
     }
 

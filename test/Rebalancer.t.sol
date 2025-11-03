@@ -61,6 +61,17 @@ contract MockNFTManager is INonfungiblePositionManager {
         return (tokenId, liquidity, amount0, amount1);
     }
 
+    function increaseLiquidity(IncreaseLiquidityParams calldata params)
+        external
+        override
+        returns (uint128 liquidity, uint256 amount0, uint256 amount1)
+    {
+        liquidity = 500;
+        amount0 = params.amount0Desired;
+        amount1 = params.amount1Desired;
+        return (liquidity, amount0, amount1);
+    }
+
     function decreaseLiquidity(DecreaseLiquidityParams calldata params)
         external
         override

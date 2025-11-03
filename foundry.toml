@@ -7,6 +7,7 @@ optimizer = true
 optimizer_runs = 200
 via_ir = false
 evm_version = "paris"
+exclude = ["reference"]
 remappings = [
     "@openzeppelin/=lib/openzeppelin-contracts/",
 ]
