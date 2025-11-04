@@ -5,6 +5,7 @@ import "@openzeppelin/contracts/access/Ownable.sol";
 import "@openzeppelin/contracts/token/ERC721/utils/ERC721Holder.sol";
 import "./interfaces/INonfungiblePositionManager.sol";
 import "./interfaces/ICLGauge.sol";
+import "./interfaces/ICLPool.sol";
 import "./interfaces/IERC20.sol";
 
 contract Rebalancer is Ownable, ERC721Holder {
@@ -48,14 +49,22 @@ contract Rebalancer is Ownable, ERC721Holder {
 
         IERC20 token0_ = token0();
         IERC20 token1_ = token1();
-        uint256 amount0 = token0_.balanceOf(address(this));
-        uint256 amount1 = token1_.balanceOf(address(this));
+        uint256 balance0 = token0_.balanceOf(address(this));
+        uint256 balance1 = token1_.balanceOf(address(this));
 
         // Skip creating new position if balances are too low
         // This can happen if position was closed but fees were minimal
-        if (amount0 == 0 && amount1 == 0) {
+        if (balance0 == 0 && balance1 == 0) {
             return; // No tokens to create position with
         }
+
+        // Compute optimal amounts using advanced calculation
+        (uint256 amount0, uint256 amount1) = _computeDesiredAmounts(
+            tickLower,
+            tickUpper,
+            balance0,
+            balance1
+        );
 
         // Approve tokens for NFT Manager before minting
         token0_.approve(address(nft), amount0);
@@ -169,5 +178,213 @@ contract Rebalancer is Ownable, ERC721Holder {
 
     function rescueERC20(address token, address to, uint256 amount) external onlyOwner {
         IERC20(token).transfer(to, amount);
+    }
+
+    /// @notice Внешняя функция для безопасного вычисления sqrtPrice (для try-catch)
+    function getSqrtRatioAtTickSafe(int24 tick) external pure returns (uint160) {
+        return _getSqrtRatioAtTick(tick);
+    }
+
+    /// @notice Безопасная версия вычисления соотношения с защитой от переполнения
+    function _calculateRatioSafe(
+        uint160 sqrtPriceCurrent,
+        uint160 sqrtPriceLower,
+        uint160 sqrtPriceUpper
+    ) internal pure returns (uint256) {
+        // Проверяем, что все значения валидны
+        if (sqrtPriceCurrent == 0 || sqrtPriceLower == 0 || sqrtPriceUpper == 0) {
+            return type(uint256).max;
+        }
+        
+        return _calculateRatioInternal(sqrtPriceCurrent, sqrtPriceLower, sqrtPriceUpper);
+    }
+    
+    /// @notice Внутренняя функция вычисления соотношения
+    function _calculateRatioInternal(
+        uint160 sqrtPriceCurrent,
+        uint160 sqrtPriceLower,
+        uint160 sqrtPriceUpper
+    ) internal pure returns (uint256) {
+        uint256 Q96 = 2**96;
+        uint256 sqrtPriceUpper_ = uint256(sqrtPriceUpper);
+        uint256 sqrtPriceCurrent_ = uint256(sqrtPriceCurrent);
+        uint256 sqrtPriceLower_ = uint256(sqrtPriceLower);
+        
+        // Определяем порядок цен
+        bool priceOrder = sqrtPriceLower_ < sqrtPriceUpper_;
+        
+        uint256 diffUpper;
+        uint256 diffLower;
+        
+        if (priceOrder) {
+            // Нормальный порядок (положительные тики)
+            if (sqrtPriceUpper_ <= sqrtPriceCurrent_ || sqrtPriceCurrent_ <= sqrtPriceLower_) {
+                return type(uint256).max;
+            }
+            unchecked {
+                diffUpper = sqrtPriceUpper_ - sqrtPriceCurrent_;
+                diffLower = sqrtPriceCurrent_ - sqrtPriceLower_;
+            }
+        } else {
+            // Обратный порядок (отрицательные тики)
+            if (sqrtPriceLower_ <= sqrtPriceCurrent_ || sqrtPriceCurrent_ <= sqrtPriceUpper_) {
+                return type(uint256).max;
+            }
+            unchecked {
+                diffUpper = sqrtPriceLower_ - sqrtPriceCurrent_;
+                diffLower = sqrtPriceCurrent_ - sqrtPriceUpper_;
+            }
+        }
+        
+        if (diffLower == 0) return 0;
+        
+        // ratio = [diffUpper * Q96 * 1e18] / [(sqrtPriceUpper * sqrtPriceCurrent / Q96) * diffLower]
+        // Вычисляем denominator с учетом возможного переполнения
+        uint256 priceProduct = (sqrtPriceUpper_ / Q96) * sqrtPriceCurrent_;
+        if (priceProduct == 0) {
+            // Если произведение слишком мало, используем упрощенную формулу
+            priceProduct = sqrtPriceUpper_ * sqrtPriceCurrent_ / Q96 / Q96;
+            if (priceProduct == 0) return 0;
+            return (diffUpper * 1e18) / (priceProduct * diffLower);
+        }
+        
+        uint256 denominator = priceProduct * diffLower;
+        if (denominator == 0) return 0;
+        
+        // Вычисляем numerator
+        uint256 numerator = diffUpper * Q96 * 1e18;
+        
+        return numerator / denominator;
+    }
+
+    /// @notice Вычисляет оптимальные пропорции amount0 и amount1 для максимального использования депозита
+    /// @param tickLower Нижняя граница тика диапазона
+    /// @param tickUpper Верхняя граница тика диапазона
+    /// @param balance0 Доступный баланс token0
+    /// @param balance1 Доступный баланс token1
+    /// @return amount0 Оптимальное количество token0 для депозита
+    /// @return amount1 Оптимальное количество token1 для депозита
+    function _computeDesiredAmounts(
+        int24 tickLower,
+        int24 tickUpper,
+        uint256 balance0,
+        uint256 balance1
+    ) internal view returns (uint256 amount0, uint256 amount1) {
+        // Получаем текущую цену из пула
+        ICLPool pool = gauge.pool();
+        (uint160 sqrtPriceX96, , , , , ) = pool.slot0();
+
+        // Вычисляем sqrtPrice для границ диапазона с защитой от ошибок
+        uint160 sqrtPriceLowerX96;
+        uint160 sqrtPriceUpperX96;
+        try this.getSqrtRatioAtTickSafe(tickLower) returns (uint160 price) {
+            sqrtPriceLowerX96 = price;
+        } catch {
+            return (balance0, balance1);
+        }
+        try this.getSqrtRatioAtTickSafe(tickUpper) returns (uint160 price) {
+            sqrtPriceUpperX96 = price;
+        } catch {
+            return (balance0, balance1);
+        }
+
+        // Проверяем порядок цен (для отрицательных тиков sqrtPriceLower > sqrtPriceCurrent)
+        // Для отрицательных тиков: sqrtPriceLower > sqrtPriceUpper
+        // Для положительных тиков: sqrtPriceLower < sqrtPriceUpper
+        bool priceOrder = sqrtPriceLowerX96 < sqrtPriceUpperX96;
+
+        // Если текущая цена вне диапазона
+        if (priceOrder) {
+            // Нормальный порядок (положительные тики)
+            if (sqrtPriceX96 <= sqrtPriceLowerX96) {
+                return (balance0, 0);
+            }
+            if (sqrtPriceX96 >= sqrtPriceUpperX96) {
+                return (0, balance1);
+            }
+        } else {
+            // Обратный порядок (отрицательные тики)
+            if (sqrtPriceX96 >= sqrtPriceLowerX96) {
+                return (balance0, 0);
+            }
+            if (sqrtPriceX96 <= sqrtPriceUpperX96) {
+                return (0, balance1);
+            }
+        }
+
+        // Если цена внутри диапазона - вычисляем оптимальные пропорции
+        // Используем упрощенную формулу для избежания stack too deep
+        uint256 ratio = _calculateRatioSafe(sqrtPriceX96, sqrtPriceLowerX96, sqrtPriceUpperX96);
+        
+        if (ratio == 0 || ratio == type(uint256).max) {
+            // Если вычисление не удалось, используем простые балансы
+            return (balance0, balance1);
+        }
+
+        // Вычисляем оптимальные пропорции для максимального использования балансов
+        return _calculateOptimalAmounts(balance0, balance1, ratio);
+    }
+
+    /// @notice Вычисляет оптимальные количества токенов для максимального использования балансов
+    function _calculateOptimalAmounts(
+        uint256 balance0,
+        uint256 balance1,
+        uint256 ratio
+    ) internal pure returns (uint256 amount0, uint256 amount1) {
+        // Проверяем, какой баланс ограничивает
+        if (balance0 * 1e18 > balance1 * ratio) {
+            // balance1 ограничивает
+            amount1 = balance1;
+            amount0 = (balance1 * ratio) / 1e18;
+            if (amount0 > balance0) {
+                amount0 = balance0;
+                amount1 = (balance0 * 1e18) / ratio;
+            }
+        } else {
+            // balance0 ограничивает
+            amount0 = balance0;
+            amount1 = (balance0 * 1e18) / ratio;
+            if (amount1 > balance1) {
+                amount1 = balance1;
+                amount0 = (balance1 * ratio) / 1e18;
+            }
+        }
+    }
+
+    /// @notice Вычисляет sqrtPriceX96 для заданного тика
+    /// @param tick Тик для вычисления
+    /// @return sqrtPriceX96 sqrt(price) * 2^96
+    function _getSqrtRatioAtTick(int24 tick) internal pure returns (uint160 sqrtPriceX96) {
+        // Формула из TickMath.sol: sqrt(1.0001^tick) * 2^96
+        // Для упрощения используем приближение: sqrt(1.0001^tick) ≈ 1.0001^(tick/2)
+        
+        uint256 absTick = tick < 0 ? uint256(-int256(tick)) : uint256(int256(tick));
+        require(absTick <= uint256(int256(887272)), "Tick out of range");
+
+        uint256 ratio = absTick & 0x1 != 0 ? 0xfffcb933bd6fad37aa2d162d1a594001 : 0x10000000000000000000000000000000000;
+        
+        if (absTick & 0x2 != 0) ratio = (ratio * 0xfff97272373d413259a46990580e213a) >> 128;
+        if (absTick & 0x4 != 0) ratio = (ratio * 0xfff2e50f5f656932ef12357cf3c7fdcc) >> 128;
+        if (absTick & 0x8 != 0) ratio = (ratio * 0xffe5caca7e10e4e61c3624eaa0941cd0) >> 128;
+        if (absTick & 0x10 != 0) ratio = (ratio * 0xffcb9843d60f6159c9db58835c926644) >> 128;
+        if (absTick & 0x20 != 0) ratio = (ratio * 0xff973b41fa98c081472e6896dfb254c0) >> 128;
+        if (absTick & 0x40 != 0) ratio = (ratio * 0xff2ea16466c96a3843ec78b326b52861) >> 128;
+        if (absTick & 0x80 != 0) ratio = (ratio * 0xfe5dee046a99a2a811c461f1969c3053) >> 128;
+        if (absTick & 0x100 != 0) ratio = (ratio * 0xfcbe86c7900a88aedcffc83b479aa3a4) >> 128;
+        if (absTick & 0x200 != 0) ratio = (ratio * 0xf987a7253ac413176f2b074cf7815e54) >> 128;
+        if (absTick & 0x400 != 0) ratio = (ratio * 0xf3392b0822b70005940c7a398e4b70f3) >> 128;
+        if (absTick & 0x800 != 0) ratio = (ratio * 0xe7159475a2c29b7443b29c7fa6e889d9) >> 128;
+        if (absTick & 0x1000 != 0) ratio = (ratio * 0xd097f3bdfd2022b8845ad8f792aa5825) >> 128;
+        if (absTick & 0x2000 != 0) ratio = (ratio * 0xa9f746462d870fdf8a65dc1f90e061e5) >> 128;
+        if (absTick & 0x4000 != 0) ratio = (ratio * 0x70d869a156d2a1b890bb3df62baf32f7) >> 128;
+        if (absTick & 0x8000 != 0) ratio = (ratio * 0x31be135f97d08fd981231505542fcfa6) >> 128;
+        if (absTick & 0x10000 != 0) ratio = (ratio * 0x9aa508b5b7a84e1c677de54f3e99bc9) >> 128;
+        if (absTick & 0x20000 != 0) ratio = (ratio * 0x5d6af8dedb81196699c329225ee604) >> 128;
+        if (absTick & 0x40000 != 0) ratio = (ratio * 0x2216e584f5fa1ea926041bedfe98) >> 128;
+        if (absTick & 0x80000 != 0) ratio = (ratio * 0x48a170391f7dc42444e8fa2) >> 128;
+
+        if (tick > 0) ratio = type(uint256).max / ratio;
+
+        sqrtPriceX96 = uint160((ratio >> 32) + (ratio % (1 << 32) == 0 ? 0 : 1));
     }
 }

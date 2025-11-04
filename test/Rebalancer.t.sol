@@ -106,18 +106,43 @@ contract MockNFTManager is INonfungiblePositionManager {
     }
 }
 
+contract MockPool {
+    uint160 public sqrtPriceX96;
+    int24 public tick;
+
+    constructor(uint160 _sqrtPriceX96, int24 _tick) {
+        sqrtPriceX96 = _sqrtPriceX96;
+        tick = _tick;
+    }
+
+    function slot0() external view returns (
+        uint160 sqrtPriceX96_,
+        int24 tick_,
+        uint16,
+        uint16,
+        uint16,
+        bool
+    ) {
+        return (sqrtPriceX96, tick, 0, 0, 0, true);
+    }
+}
+
 contract MockGauge {
     mapping(uint256 => bool) public deposited;
     address public token0;
     address public token1;
     int24 public tickSpacing;
     address public rewardToken;
+    MockPool public pool;
 
     constructor(address _token0, address _token1, int24 _tickSpacing, address _rewardToken) {
         token0 = _token0;
         token1 = _token1;
         tickSpacing = _tickSpacing;
         rewardToken = _rewardToken;
+        // Initialize pool with default price (around tick 0)
+        // sqrtPriceX96 = sqrt(1) * 2^96 = 2^96
+        pool = new MockPool(79228162514264337593543950336, 0);
     }
 
     function deposit(uint256 tokenId) external {
