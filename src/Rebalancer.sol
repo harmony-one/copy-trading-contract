@@ -12,10 +12,49 @@ contract Rebalancer is Ownable, ERC721Holder {
     INonfungiblePositionManager public nft;
     ICLGauge public gauge;
     uint256 public currentTokenId;
+    
+    // Cached values for gas optimization
+    address private _token0;
+    address private _token1;
+    int24 private _tickSpacing;
+    uint8 private _decimals0;
+    uint8 private _decimals1;
+    bool private _tokensCached;
+    bool private _decimalsCached;
+    bool private _token0Approved;
+    bool private _token1Approved;
 
     constructor(address _nft, address _gauge, address _owner) Ownable(_owner) {
         nft = INonfungiblePositionManager(_nft);
         gauge = ICLGauge(_gauge);
+    }
+    
+    /// @notice Caches token addresses and tickSpacing for gas optimization
+    function _cacheTokens() internal {
+        if (!_tokensCached) {
+            _token0 = gauge.token0();
+            _token1 = gauge.token1();
+            _tickSpacing = gauge.tickSpacing();
+            _tokensCached = true;
+        }
+    }
+    
+    /// @notice Caches token decimals for gas optimization
+    function _cacheDecimals() internal {
+        if (!_decimalsCached) {
+            _cacheTokens(); // Ensure tokens are cached
+            try IERC20(_token0).decimals() returns (uint8 decimals) {
+                _decimals0 = decimals;
+            } catch {
+                _decimals0 = 18;
+            }
+            try IERC20(_token1).decimals() returns (uint8 decimals) {
+                _decimals1 = decimals;
+            } catch {
+                _decimals1 = 18;
+            }
+            _decimalsCached = true;
+        }
     }
 
     function token0() public view returns (IERC20) {
@@ -58,45 +97,59 @@ contract Rebalancer is Ownable, ERC721Holder {
     }
 
     function rebalance(int24 tickLower, int24 tickUpper) external onlyOwner {
+        // Cache token addresses and decimals for gas optimization
+        _cacheTokens();
+        _cacheDecimals();
+        
         // Close existing positions first
         if (currentTokenId != 0) {
             _closeAllPositions();
         }
 
-        IERC20 token0_ = token0();
-        IERC20 token1_ = token1();
+        // Use cached addresses instead of view function calls
+        IERC20 token0_ = IERC20(_token0);
+        IERC20 token1_ = IERC20(_token1);
         uint256 balance0 = token0_.balanceOf(address(this));
         uint256 balance1 = token1_.balanceOf(address(this));
 
         // Skip creating new position if balances are too low
-        // This can happen if position was closed but fees were minimal
         if (balance0 == 0 && balance1 == 0) {
-            return; // No tokens to create position with
+            return;
         }
 
         // Compute optimal amounts using advanced calculation
-        // This handles cases where one balance is zero and price is outside range
+        // Pass cached decimals to avoid repeated calls
         (uint256 amount0, uint256 amount1) = _computeDesiredAmounts(
             tickLower,
             tickUpper,
             balance0,
-            balance1
+            balance1,
+            _decimals0,
+            _decimals1
         );
 
         // If computed amounts are both zero, skip creating position
-        // This can happen if price is inside range but one balance is zero
         if (amount0 == 0 && amount1 == 0) {
             return;
         }
 
-        // Approve tokens for NFT Manager before minting
-        token0_.approve(address(nft), amount0);
-        token1_.approve(address(nft), amount1);
+        // Approve tokens for NFT Manager - approve to maximum value immediately
+        // Use flags to track and avoid repeated approve calls
+        address nftAddr = address(nft);
+        if (amount0 > 0 && !_token0Approved) {
+            token0_.approve(nftAddr, type(uint256).max);
+            _token0Approved = true;
+        }
+        if (amount1 > 0 && !_token1Approved) {
+            token1_.approve(nftAddr, type(uint256).max);
+            _token1Approved = true;
+        }
 
+        // Use cached tickSpacing
         INonfungiblePositionManager.MintParams memory params = INonfungiblePositionManager.MintParams({
-            token0: address(token0_),
-            token1: address(token1_),
-            tickSpacing: tickSpacing(),
+            token0: _token0,
+            token1: _token1,
+            tickSpacing: _tickSpacing,
             tickLower: tickLower,
             tickUpper: tickUpper,
             amount0Desired: amount0,
@@ -104,7 +157,7 @@ contract Rebalancer is Ownable, ERC721Holder {
             amount0Min: 0,
             amount1Min: 0,
             recipient: address(this),
-            deadline: block.timestamp + 1 hours,
+            deadline: block.timestamp + 3600, // 1 hour in seconds (avoid calculation)
             sqrtPriceX96: 0
         });
 
@@ -114,8 +167,7 @@ contract Rebalancer is Ownable, ERC721Holder {
             nft.approve(address(gauge), tokenId);
             gauge.deposit(tokenId);
         } catch {
-            // If mint fails (e.g., too little liquidity), skip creating new position
-            // This can happen if balances are too low after closing previous position
+            // If mint fails, skip creating new position
             currentTokenId = 0;
         }
     }
@@ -153,11 +205,12 @@ contract Rebalancer is Ownable, ERC721Holder {
                         liquidity: currentLiquidity, // Decrease all liquidity
                         amount0Min: 0,
                         amount1Min: 0,
-                        deadline: block.timestamp + 1 hours
+                        deadline: block.timestamp + 3600
                     })
                 );
                 
                 // Collect tokens released from liquidity decrease
+                // Note: gauge.withdraw() already collected fees, this collects tokens from decreaseLiquidity
                 nft.collect(
                     INonfungiblePositionManager.CollectParams({
                         tokenId: tokenId,
@@ -168,17 +221,9 @@ contract Rebalancer is Ownable, ERC721Holder {
                 );
             }
             
-            // Step 4: Final collect to ensure all fees and tokens are collected
-            try nft.collect(
-                INonfungiblePositionManager.CollectParams({
-                    tokenId: tokenId,
-                    recipient: address(this),
-                    amount0Max: type(uint128).max,
-                    amount1Max: type(uint128).max
-                })
-            ) {} catch {}
-            
-            // Step 5: Burn the NFT - now position should be empty
+            // Step 4: Burn the NFT - now position should be empty
+            // Note: gauge.withdraw() already collected fees, and we collected tokens from decreaseLiquidity
+            // No need for additional collect call
             // burn() requires position to have zero liquidity and all tokens collected
             nft.burn(tokenId);
         }
@@ -203,18 +248,18 @@ contract Rebalancer is Ownable, ERC721Holder {
         IERC20(token).transfer(to, amount);
     }
 
-    /// @notice Внешняя функция для безопасного вычисления sqrtPrice (для try-catch)
+    /// @notice External function for safe sqrtPrice calculation (for try-catch)
     function getSqrtRatioAtTickSafe(int24 tick) external pure returns (uint160) {
         return _getSqrtRatioAtTick(tick);
     }
 
-    /// @notice Безопасная версия вычисления соотношения с защитой от переполнения
+    /// @notice Safe version of ratio calculation with overflow protection
     function _calculateRatioSafe(
         uint160 sqrtPriceCurrent,
         uint160 sqrtPriceLower,
         uint160 sqrtPriceUpper
     ) internal pure returns (uint256) {
-        // Проверяем, что все значения валидны
+        // Check that all values are valid
         if (sqrtPriceCurrent == 0 || sqrtPriceLower == 0 || sqrtPriceUpper == 0) {
             return type(uint256).max;
         }
@@ -222,7 +267,7 @@ contract Rebalancer is Ownable, ERC721Holder {
         return _calculateRatioInternal(sqrtPriceCurrent, sqrtPriceLower, sqrtPriceUpper);
     }
     
-    /// @notice Внутренняя функция вычисления соотношения
+    /// @notice Internal function for ratio calculation
     function _calculateRatioInternal(
         uint160 sqrtPriceCurrent,
         uint160 sqrtPriceLower,
@@ -233,14 +278,14 @@ contract Rebalancer is Ownable, ERC721Holder {
         uint256 sqrtPriceCurrent_ = uint256(sqrtPriceCurrent);
         uint256 sqrtPriceLower_ = uint256(sqrtPriceLower);
         
-        // Определяем порядок цен
+        // Determine price order
         bool priceOrder = sqrtPriceLower_ < sqrtPriceUpper_;
         
         uint256 diffUpper;
         uint256 diffLower;
         
         if (priceOrder) {
-            // Нормальный порядок (положительные тики)
+            // Normal order (positive ticks)
             if (sqrtPriceUpper_ <= sqrtPriceCurrent_ || sqrtPriceCurrent_ <= sqrtPriceLower_) {
                 return type(uint256).max;
             }
@@ -249,7 +294,7 @@ contract Rebalancer is Ownable, ERC721Holder {
                 diffLower = sqrtPriceCurrent_ - sqrtPriceLower_;
             }
         } else {
-            // Обратный порядок (отрицательные тики)
+            // Reverse order (negative ticks)
             if (sqrtPriceLower_ <= sqrtPriceCurrent_ || sqrtPriceCurrent_ <= sqrtPriceUpper_) {
                 return type(uint256).max;
             }
@@ -262,10 +307,10 @@ contract Rebalancer is Ownable, ERC721Holder {
         if (diffLower == 0) return 0;
         
         // ratio = [diffUpper * Q96 * 1e18] / [(sqrtPriceUpper * sqrtPriceCurrent / Q96) * diffLower]
-        // Вычисляем denominator с учетом возможного переполнения
+        // Calculate denominator with overflow protection
         uint256 priceProduct = (sqrtPriceUpper_ / Q96) * sqrtPriceCurrent_;
         if (priceProduct == 0) {
-            // Если произведение слишком мало, используем упрощенную формулу
+            // If product is too small, use simplified formula
             priceProduct = sqrtPriceUpper_ * sqrtPriceCurrent_ / Q96 / Q96;
             if (priceProduct == 0) return 0;
             return (diffUpper * 1e18) / (priceProduct * diffLower);
@@ -274,39 +319,43 @@ contract Rebalancer is Ownable, ERC721Holder {
         uint256 denominator = priceProduct * diffLower;
         if (denominator == 0) return 0;
         
-        // Вычисляем numerator
+        // Calculate numerator
         uint256 numerator = diffUpper * Q96 * 1e18;
         
         return numerator / denominator;
     }
 
-    /// @notice Вычисляет оптимальные пропорции amount0 и amount1 для максимального использования депозита
-    /// @param tickLower Нижняя граница тика диапазона
-    /// @param tickUpper Верхняя граница тика диапазона
-    /// @param balance0 Доступный баланс token0
-    /// @param balance1 Доступный баланс token1
-    /// @return amount0 Оптимальное количество token0 для депозита
-    /// @return amount1 Оптимальное количество token1 для депозита
+    /// @notice Calculates optimal proportions of amount0 and amount1 for maximum deposit utilization
+    /// @param tickLower Lower tick boundary of the range
+    /// @param tickUpper Upper tick boundary of the range
+    /// @param balance0 Available balance of token0
+    /// @param balance1 Available balance of token1
+    /// @param decimals0 Number of decimals for token0 (for gas optimization)
+    /// @param decimals1 Number of decimals for token1 (for gas optimization)
+    /// @return amount0 Optimal amount of token0 for deposit
+    /// @return amount1 Optimal amount of token1 for deposit
     function _computeDesiredAmounts(
         int24 tickLower,
         int24 tickUpper,
         uint256 balance0,
-        uint256 balance1
+        uint256 balance1,
+        uint8 decimals0,
+        uint8 decimals1
     ) internal view returns (uint256 amount0, uint256 amount1) {
-        // Обработка случая, когда один из балансов равен 0
+        // Handle case when one balance is zero
         if (balance0 == 0 && balance1 > 0) {
-            // Есть только balance1, нужно проверить, можно ли использовать его
+            // Only balance1 available, check if it can be used
             return _computeDesiredAmountsSingleToken(tickLower, tickUpper, balance1, false);
         } else if (balance1 == 0 && balance0 > 0) {
-            // Есть только balance0, нужно проверить, можно ли использовать его
+            // Only balance0 available, check if it can be used
             return _computeDesiredAmountsSingleToken(tickLower, tickUpper, balance0, true);
         }
 
-        // Получаем текущую цену из пула
+        // Get current price from pool
         ICLPool pool = gauge.pool();
         (uint160 sqrtPriceX96, , , , , ) = pool.slot0();
 
-        // Вычисляем sqrtPrice для границ диапазона с защитой от ошибок
+        // Calculate sqrtPrice for range boundaries with error protection
         uint160 sqrtPriceLowerX96;
         uint160 sqrtPriceUpperX96;
         try this.getSqrtRatioAtTickSafe(tickLower) returns (uint160 price) {
@@ -320,14 +369,14 @@ contract Rebalancer is Ownable, ERC721Holder {
             return (balance0, balance1);
         }
 
-        // Проверяем порядок цен (для отрицательных тиков sqrtPriceLower > sqrtPriceCurrent)
-        // Для отрицательных тиков: sqrtPriceLower > sqrtPriceUpper
-        // Для положительных тиков: sqrtPriceLower < sqrtPriceUpper
+        // Check price order (for negative ticks sqrtPriceLower > sqrtPriceCurrent)
+        // For negative ticks: sqrtPriceLower > sqrtPriceUpper
+        // For positive ticks: sqrtPriceLower < sqrtPriceUpper
         bool priceOrder = sqrtPriceLowerX96 < sqrtPriceUpperX96;
 
-        // Если текущая цена вне диапазона
+        // If current price is outside the range
         if (priceOrder) {
-            // Нормальный порядок (положительные тики)
+            // Normal order (positive ticks)
             if (sqrtPriceX96 <= sqrtPriceLowerX96) {
                 return (balance0, 0);
             }
@@ -335,7 +384,7 @@ contract Rebalancer is Ownable, ERC721Holder {
                 return (0, balance1);
             }
         } else {
-            // Обратный порядок (отрицательные тики)
+            // Reverse order (negative ticks)
             if (sqrtPriceX96 >= sqrtPriceLowerX96) {
                 return (balance0, 0);
             }
@@ -344,47 +393,44 @@ contract Rebalancer is Ownable, ERC721Holder {
             }
         }
 
-        // Если цена внутри диапазона - вычисляем оптимальные пропорции
-        // Используем упрощенную формулу для избежания stack too deep
+        // If price is inside the range - calculate optimal proportions
+        // Use simplified formula to avoid stack too deep
         uint256 ratio = _calculateRatioSafe(sqrtPriceX96, sqrtPriceLowerX96, sqrtPriceUpperX96);
         
         if (ratio == 0 || ratio == type(uint256).max) {
-            // Если вычисление не удалось, используем простые балансы
+            // If calculation failed, use simple balances
             return (balance0, balance1);
         }
 
-        // Получаем decimals для корректного расчета
-        uint8 decimals0 = token0Decimals();
-        uint8 decimals1 = token1Decimals();
-
-        // Вычисляем оптимальные пропорции для максимального использования балансов
+        // Calculate optimal proportions for maximum balance utilization
+        // Use passed decimals to avoid repeated calls
         return _calculateOptimalAmounts(balance0, balance1, ratio, decimals0, decimals1);
     }
 
-    /// @notice Вычисляет оптимальные количества когда доступен только один токен
-    /// @param tickLower Нижняя граница тика диапазона
-    /// @param tickUpper Верхняя граница тика диапазона
-    /// @param balance Баланс доступного токена
-    /// @param isToken0 true если это token0, false если token1
-    /// @return amount0 Количество token0 для депозита
-    /// @return amount1 Количество token1 для депозита
+    /// @notice Calculates optimal amounts when only one token is available
+    /// @param tickLower Lower tick boundary of the range
+    /// @param tickUpper Upper tick boundary of the range
+    /// @param balance Balance of available token
+    /// @param isToken0 true if this is token0, false if token1
+    /// @return amount0 Amount of token0 for deposit
+    /// @return amount1 Amount of token1 for deposit
     function _computeDesiredAmountsSingleToken(
         int24 tickLower,
         int24 tickUpper,
         uint256 balance,
         bool isToken0
     ) internal view returns (uint256 amount0, uint256 amount1) {
-        // Получаем текущую цену из пула
+        // Get current price from pool
         ICLPool pool = gauge.pool();
         (uint160 sqrtPriceX96, , , , , ) = pool.slot0();
 
-        // Вычисляем sqrtPrice для границ диапазона с защитой от ошибок
+        // Calculate sqrtPrice for range boundaries with error protection
         uint160 sqrtPriceLowerX96;
         uint160 sqrtPriceUpperX96;
         try this.getSqrtRatioAtTickSafe(tickLower) returns (uint160 price) {
             sqrtPriceLowerX96 = price;
         } catch {
-            return (0, 0); // Не можем создать позицию без цены
+            return (0, 0); // Cannot create position without price
         }
         try this.getSqrtRatioAtTickSafe(tickUpper) returns (uint160 price) {
             sqrtPriceUpperX96 = price;
@@ -392,10 +438,10 @@ contract Rebalancer is Ownable, ERC721Holder {
             return (0, 0);
         }
 
-        // Проверяем порядок цен
+        // Check price order
         bool priceOrder = sqrtPriceLowerX96 < sqrtPriceUpperX96;
 
-        // Определяем, где находится цена относительно диапазона
+        // Determine where price is relative to the range
         bool priceBelowRange;
         bool priceAboveRange;
         
@@ -407,30 +453,30 @@ contract Rebalancer is Ownable, ERC721Holder {
             priceAboveRange = sqrtPriceX96 <= sqrtPriceUpperX96;
         }
 
-        // Если цена вне диапазона, можно использовать один токен
+        // If price is outside range, can use single token
         if (priceBelowRange) {
-            // Цена ниже диапазона - нужен только token0
+            // Price below range - only token0 needed
             if (isToken0) {
                 return (balance, 0);
             } else {
-                return (0, 0); // Нужен token0, но его нет
+                return (0, 0); // Need token0 but it's not available
             }
         } else if (priceAboveRange) {
-            // Цена выше диапазона - нужен только token1
+            // Price above range - only token1 needed
             if (!isToken0) {
                 return (0, balance);
             } else {
-                return (0, 0); // Нужен token1, но его нет
+                return (0, 0); // Need token1 but it's not available
             }
         } else {
-            // Цена внутри диапазона - нужны оба токена
-            // Не можем создать позицию только с одним токеном
+            // Price inside range - both tokens needed
+            // Cannot create position with only one token
             return (0, 0);
         }
     }
 
-    /// @notice Вычисляет оптимальные количества токенов для максимального использования балансов
-    /// @dev ratio = amount0/amount1 в масштабе 1e18 (нормализовано по decimals)
+    /// @notice Calculates optimal token amounts for maximum balance utilization
+    /// @dev ratio = amount0/amount1 in scale 1e18 (normalized by decimals)
     function _calculateOptimalAmounts(
         uint256 balance0,
         uint256 balance1,
@@ -438,7 +484,7 @@ contract Rebalancer is Ownable, ERC721Holder {
         uint8 decimals0,
         uint8 decimals1
     ) internal pure returns (uint256 amount0, uint256 amount1) {
-        // Корректируем ratio с учетом разницы decimals
+        // Adjust ratio based on decimals difference
         uint256 adjustedRatio = ratio;
         if (decimals0 > decimals1) {
             adjustedRatio = ratio * (10 ** (decimals0 - decimals1));
@@ -446,31 +492,31 @@ contract Rebalancer is Ownable, ERC721Holder {
             adjustedRatio = ratio / (10 ** (decimals1 - decimals0));
         }
         
-        // Нормализуем балансы к максимальному decimals
+        // Normalize balances to maximum decimals
         uint8 maxDecimals = decimals0 > decimals1 ? decimals0 : decimals1;
         uint256 norm0 = decimals0 < maxDecimals ? balance0 * (10 ** (maxDecimals - decimals0)) : balance0;
         uint256 norm1 = decimals1 < maxDecimals ? balance1 * (10 ** (maxDecimals - decimals1)) : balance1;
         
-        // Вычисляем варианты использования
+        // Calculate usage options
         uint256 amt0From1 = (norm1 * adjustedRatio) / 1e18;
         uint256 amt1From0 = (norm0 * 1e18) / adjustedRatio;
         
-        // Выбираем оптимальный вариант
+        // Select optimal option
         if (amt0From1 <= norm0) {
-            // Используем весь balance1
+            // Use entire balance1
             amount0 = decimals0 < maxDecimals ? amt0From1 / (10 ** (maxDecimals - decimals0)) : amt0From1;
             amount1 = balance1;
         } else if (amt1From0 <= norm1) {
-            // Используем весь balance0
+            // Use entire balance0
             amount0 = balance0;
             amount1 = decimals1 < maxDecimals ? amt1From0 / (10 ** (maxDecimals - decimals1)) : amt1From0;
         } else {
-            // Оба превышают - выбираем вариант с большей суммой
+            // Both exceed - select option with larger sum
             return _calculateOptimalAmountsFallback(balance0, balance1, adjustedRatio, norm0, norm1, decimals0, decimals1, maxDecimals);
         }
     }
     
-    /// @notice Fallback для случая когда оба варианта превышают балансы
+    /// @notice Fallback for case when both options exceed balances
     function _calculateOptimalAmountsFallback(
         uint256 balance0,
         uint256 balance1,
@@ -502,12 +548,12 @@ contract Rebalancer is Ownable, ERC721Holder {
         }
     }
 
-    /// @notice Вычисляет sqrtPriceX96 для заданного тика
-    /// @param tick Тик для вычисления
+    /// @notice Calculates sqrtPriceX96 for given tick
+    /// @param tick Tick for calculation
     /// @return sqrtPriceX96 sqrt(price) * 2^96
     function _getSqrtRatioAtTick(int24 tick) internal pure returns (uint160 sqrtPriceX96) {
-        // Формула из TickMath.sol: sqrt(1.0001^tick) * 2^96
-        // Для упрощения используем приближение: sqrt(1.0001^tick) ≈ 1.0001^(tick/2)
+        // Formula from TickMath.sol: sqrt(1.0001^tick) * 2^96
+        // For simplification we use approximation: sqrt(1.0001^tick) ≈ 1.0001^(tick/2)
         
         uint256 absTick = tick < 0 ? uint256(-int256(tick)) : uint256(int256(tick));
         require(absTick <= uint256(int256(887272)), "Tick out of range");
