@@ -34,6 +34,22 @@ contract Rebalancer is Ownable, ERC721Holder {
         return IERC20(gauge.rewardToken());
     }
 
+    function token0Decimals() public view returns (uint8) {
+        try IERC20(gauge.token0()).decimals() returns (uint8 decimals) {
+            return decimals;
+        } catch {
+            return 18; // Default to 18 if decimals() is not available
+        }
+    }
+
+    function token1Decimals() public view returns (uint8) {
+        try IERC20(gauge.token1()).decimals() returns (uint8 decimals) {
+            return decimals;
+        } catch {
+            return 18; // Default to 18 if decimals() is not available
+        }
+    }
+
     function deposit(uint256 amount0, uint256 amount1) external onlyOwner {
         IERC20 token0_ = token0();
         IERC20 token1_ = token1();
@@ -59,12 +75,19 @@ contract Rebalancer is Ownable, ERC721Holder {
         }
 
         // Compute optimal amounts using advanced calculation
+        // This handles cases where one balance is zero and price is outside range
         (uint256 amount0, uint256 amount1) = _computeDesiredAmounts(
             tickLower,
             tickUpper,
             balance0,
             balance1
         );
+
+        // If computed amounts are both zero, skip creating position
+        // This can happen if price is inside range but one balance is zero
+        if (amount0 == 0 && amount1 == 0) {
+            return;
+        }
 
         // Approve tokens for NFT Manager before minting
         token0_.approve(address(nft), amount0);
@@ -270,6 +293,15 @@ contract Rebalancer is Ownable, ERC721Holder {
         uint256 balance0,
         uint256 balance1
     ) internal view returns (uint256 amount0, uint256 amount1) {
+        // Обработка случая, когда один из балансов равен 0
+        if (balance0 == 0 && balance1 > 0) {
+            // Есть только balance1, нужно проверить, можно ли использовать его
+            return _computeDesiredAmountsSingleToken(tickLower, tickUpper, balance1, false);
+        } else if (balance1 == 0 && balance0 > 0) {
+            // Есть только balance0, нужно проверить, можно ли использовать его
+            return _computeDesiredAmountsSingleToken(tickLower, tickUpper, balance0, true);
+        }
+
         // Получаем текущую цену из пула
         ICLPool pool = gauge.pool();
         (uint160 sqrtPriceX96, , , , , ) = pool.slot0();
@@ -321,32 +353,151 @@ contract Rebalancer is Ownable, ERC721Holder {
             return (balance0, balance1);
         }
 
+        // Получаем decimals для корректного расчета
+        uint8 decimals0 = token0Decimals();
+        uint8 decimals1 = token1Decimals();
+
         // Вычисляем оптимальные пропорции для максимального использования балансов
-        return _calculateOptimalAmounts(balance0, balance1, ratio);
+        return _calculateOptimalAmounts(balance0, balance1, ratio, decimals0, decimals1);
+    }
+
+    /// @notice Вычисляет оптимальные количества когда доступен только один токен
+    /// @param tickLower Нижняя граница тика диапазона
+    /// @param tickUpper Верхняя граница тика диапазона
+    /// @param balance Баланс доступного токена
+    /// @param isToken0 true если это token0, false если token1
+    /// @return amount0 Количество token0 для депозита
+    /// @return amount1 Количество token1 для депозита
+    function _computeDesiredAmountsSingleToken(
+        int24 tickLower,
+        int24 tickUpper,
+        uint256 balance,
+        bool isToken0
+    ) internal view returns (uint256 amount0, uint256 amount1) {
+        // Получаем текущую цену из пула
+        ICLPool pool = gauge.pool();
+        (uint160 sqrtPriceX96, , , , , ) = pool.slot0();
+
+        // Вычисляем sqrtPrice для границ диапазона с защитой от ошибок
+        uint160 sqrtPriceLowerX96;
+        uint160 sqrtPriceUpperX96;
+        try this.getSqrtRatioAtTickSafe(tickLower) returns (uint160 price) {
+            sqrtPriceLowerX96 = price;
+        } catch {
+            return (0, 0); // Не можем создать позицию без цены
+        }
+        try this.getSqrtRatioAtTickSafe(tickUpper) returns (uint160 price) {
+            sqrtPriceUpperX96 = price;
+        } catch {
+            return (0, 0);
+        }
+
+        // Проверяем порядок цен
+        bool priceOrder = sqrtPriceLowerX96 < sqrtPriceUpperX96;
+
+        // Определяем, где находится цена относительно диапазона
+        bool priceBelowRange;
+        bool priceAboveRange;
+        
+        if (priceOrder) {
+            priceBelowRange = sqrtPriceX96 <= sqrtPriceLowerX96;
+            priceAboveRange = sqrtPriceX96 >= sqrtPriceUpperX96;
+        } else {
+            priceBelowRange = sqrtPriceX96 >= sqrtPriceLowerX96;
+            priceAboveRange = sqrtPriceX96 <= sqrtPriceUpperX96;
+        }
+
+        // Если цена вне диапазона, можно использовать один токен
+        if (priceBelowRange) {
+            // Цена ниже диапазона - нужен только token0
+            if (isToken0) {
+                return (balance, 0);
+            } else {
+                return (0, 0); // Нужен token0, но его нет
+            }
+        } else if (priceAboveRange) {
+            // Цена выше диапазона - нужен только token1
+            if (!isToken0) {
+                return (0, balance);
+            } else {
+                return (0, 0); // Нужен token1, но его нет
+            }
+        } else {
+            // Цена внутри диапазона - нужны оба токена
+            // Не можем создать позицию только с одним токеном
+            return (0, 0);
+        }
     }
 
     /// @notice Вычисляет оптимальные количества токенов для максимального использования балансов
+    /// @dev ratio = amount0/amount1 в масштабе 1e18 (нормализовано по decimals)
     function _calculateOptimalAmounts(
         uint256 balance0,
         uint256 balance1,
-        uint256 ratio
+        uint256 ratio,
+        uint8 decimals0,
+        uint8 decimals1
     ) internal pure returns (uint256 amount0, uint256 amount1) {
-        // Проверяем, какой баланс ограничивает
-        if (balance0 * 1e18 > balance1 * ratio) {
-            // balance1 ограничивает
+        // Корректируем ratio с учетом разницы decimals
+        uint256 adjustedRatio = ratio;
+        if (decimals0 > decimals1) {
+            adjustedRatio = ratio * (10 ** (decimals0 - decimals1));
+        } else if (decimals1 > decimals0) {
+            adjustedRatio = ratio / (10 ** (decimals1 - decimals0));
+        }
+        
+        // Нормализуем балансы к максимальному decimals
+        uint8 maxDecimals = decimals0 > decimals1 ? decimals0 : decimals1;
+        uint256 norm0 = decimals0 < maxDecimals ? balance0 * (10 ** (maxDecimals - decimals0)) : balance0;
+        uint256 norm1 = decimals1 < maxDecimals ? balance1 * (10 ** (maxDecimals - decimals1)) : balance1;
+        
+        // Вычисляем варианты использования
+        uint256 amt0From1 = (norm1 * adjustedRatio) / 1e18;
+        uint256 amt1From0 = (norm0 * 1e18) / adjustedRatio;
+        
+        // Выбираем оптимальный вариант
+        if (amt0From1 <= norm0) {
+            // Используем весь balance1
+            amount0 = decimals0 < maxDecimals ? amt0From1 / (10 ** (maxDecimals - decimals0)) : amt0From1;
             amount1 = balance1;
-            amount0 = (balance1 * ratio) / 1e18;
-            if (amount0 > balance0) {
-                amount0 = balance0;
-                amount1 = (balance0 * 1e18) / ratio;
-            }
-        } else {
-            // balance0 ограничивает
+        } else if (amt1From0 <= norm1) {
+            // Используем весь balance0
             amount0 = balance0;
-            amount1 = (balance0 * 1e18) / ratio;
-            if (amount1 > balance1) {
+            amount1 = decimals1 < maxDecimals ? amt1From0 / (10 ** (maxDecimals - decimals1)) : amt1From0;
+        } else {
+            // Оба превышают - выбираем вариант с большей суммой
+            return _calculateOptimalAmountsFallback(balance0, balance1, adjustedRatio, norm0, norm1, decimals0, decimals1, maxDecimals);
+        }
+    }
+    
+    /// @notice Fallback для случая когда оба варианта превышают балансы
+    function _calculateOptimalAmountsFallback(
+        uint256 balance0,
+        uint256 balance1,
+        uint256 adjustedRatio,
+        uint256 norm0,
+        uint256 norm1,
+        uint8 decimals0,
+        uint8 decimals1,
+        uint8 maxDecimals
+    ) internal pure returns (uint256 amount0, uint256 amount1) {
+        uint256 amt1A = (norm0 * 1e18) / adjustedRatio;
+        uint256 amt0B = (norm1 * adjustedRatio) / 1e18;
+        
+        if (amt1A <= norm1 && (amt0B > norm0 || norm0 + amt1A >= amt0B + norm1)) {
+            amount0 = balance0;
+            amount1 = decimals1 < maxDecimals ? amt1A / (10 ** (maxDecimals - decimals1)) : amt1A;
+        } else if (amt0B <= norm0) {
+            amount0 = decimals0 < maxDecimals ? amt0B / (10 ** (maxDecimals - decimals0)) : amt0B;
+            amount1 = balance1;
+        } else {
+            amount0 = balance0;
+            uint256 amt1Calc = (norm0 * 1e18) / adjustedRatio;
+            if (amt1Calc > norm1) {
                 amount1 = balance1;
-                amount0 = (balance1 * ratio) / 1e18;
+                amount0 = decimals0 < maxDecimals ? ((norm1 * adjustedRatio) / 1e18) / (10 ** (maxDecimals - decimals0)) : ((norm1 * adjustedRatio) / 1e18);
+            } else {
+                amount1 = decimals1 < maxDecimals ? amt1Calc / (10 ** (maxDecimals - decimals1)) : amt1Calc;
             }
         }
     }

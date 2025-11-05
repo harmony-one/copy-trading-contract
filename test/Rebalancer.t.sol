@@ -377,5 +377,44 @@ contract RebalancerTest is Test {
         // Should create a new position (different tokenId)
         assertTrue(tokenId2 != tokenId1 || tokenId2 == 2);
     }
+
+    function testRebalanceWithOnlyToken0() public {
+        uint256 amount0 = 1000e18;
+
+        token0.mint(owner, amount0);
+        token0.approve(address(rebalancer), amount0);
+
+        rebalancer.deposit(amount0, 0);
+
+        int24 tickLower = -1000;
+        int24 tickUpper = 1000;
+
+        // Rebalance should work if price is below range (needs only token0)
+        // or should skip if price is inside/above range (needs both tokens)
+        rebalancer.rebalance(tickLower, tickUpper);
+        
+        // Check that rebalance didn't revert (it might create position or skip)
+        // The behavior depends on current price position
+        assertTrue(true); // Just check it doesn't revert
+    }
+
+    function testRebalanceWithOnlyToken1() public {
+        uint256 amount1 = 2000e18;
+
+        token1.mint(owner, amount1);
+        token1.approve(address(rebalancer), amount1);
+
+        rebalancer.deposit(0, amount1);
+
+        int24 tickLower = -1000;
+        int24 tickUpper = 1000;
+
+        // Rebalance should work if price is above range (needs only token1)
+        // or should skip if price is inside/below range (needs both tokens)
+        rebalancer.rebalance(tickLower, tickUpper);
+        
+        // Check that rebalance didn't revert
+        assertTrue(true); // Just check it doesn't revert
+    }
 }
 
