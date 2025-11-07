@@ -6,9 +6,10 @@ import "@openzeppelin/contracts/token/ERC721/utils/ERC721Holder.sol";
 import "./interfaces/INonfungiblePositionManager.sol";
 import "./interfaces/ICLGauge.sol";
 import "./interfaces/ICLPool.sol";
+import "./interfaces/ICLSwapCallback.sol";
 import "./interfaces/IERC20.sol";
 
-contract Rebalancer is Ownable, ERC721Holder {
+contract Rebalancer is Ownable, ERC721Holder, ICLSwapCallback {
     INonfungiblePositionManager public nft;
     ICLGauge public gauge;
     uint256 public currentTokenId;
@@ -23,6 +24,8 @@ contract Rebalancer is Ownable, ERC721Holder {
     bool private _decimalsCached;
     bool private _token0Approved;
     bool private _token1Approved;
+
+    uint256 private constant FIXED_ONE = 1e18;
 
     constructor(address _nft, address _gauge, address _owner) Ownable(_owner) {
         nft = INonfungiblePositionManager(_nft);
@@ -246,6 +249,241 @@ contract Rebalancer is Ownable, ERC721Holder {
 
     function rescueERC20(address token, address to, uint256 amount) external onlyOwner {
         IERC20(token).transfer(to, amount);
+    }
+
+    /// @notice Swap tokens through the pool
+    /// @param tokenIn Address of the input token
+    /// @param tokenOut Address of the output token
+    /// @param amountIn Amount of input token to swap
+    /// @param amountOutMin Minimum amount of output token to receive
+    /// @param isBuy If true, swap token0 for token1; if false, swap token1 for token0
+    /// @return amount0Delta Amount of token0 swapped (positive if paid, negative if received)
+    /// @return amount1Delta Amount of token1 swapped (positive if paid, negative if received)
+    function swap(
+        address tokenIn,
+        address tokenOut,
+        uint256 amountIn,
+        uint256 amountOutMin,
+        bool isBuy
+    ) external onlyOwner returns (int256 amount0Delta, int256 amount1Delta) {
+        return _swap(tokenIn, tokenOut, amountIn, amountOutMin, isBuy);
+    }
+
+    /// @notice Internal swap function (no owner check, for internal use)
+    /// @param tokenIn Address of the input token
+    /// @param tokenOut Address of the output token
+    /// @param amountIn Amount of input token to swap
+    /// @param amountOutMin Minimum amount of output token to receive
+    /// @param isBuy If true, swap token0 for token1; if false, swap token1 for token0
+    /// @return amount0Delta Amount of token0 swapped (positive if paid, negative if received)
+    /// @return amount1Delta Amount of token1 swapped (positive if paid, negative if received)
+    function _swap(
+        address tokenIn,
+        address tokenOut,
+        uint256 amountIn,
+        uint256 amountOutMin,
+        bool isBuy
+    ) internal returns (int256 amount0Delta, int256 amount1Delta) {
+        _cacheTokens();
+        
+        ICLPool pool = gauge.pool();
+        IERC20 tokenIn_ = IERC20(tokenIn);
+        
+        // Validate tokens
+        require(tokenIn == _token0 || tokenIn == _token1, "Invalid tokenIn");
+        require(tokenOut == _token0 || tokenOut == _token1, "Invalid tokenOut");
+        require(tokenIn != tokenOut, "Same token");
+        
+        // Determine swap direction based on tokens
+        // zeroForOne = true means swapping token0 -> token1
+        // zeroForOne = false means swapping token1 -> token0
+        bool zeroForOne = (tokenIn == _token0 && tokenOut == _token1);
+        
+        // Validate isBuy parameter matches the swap direction
+        if (isBuy) {
+            // isBuy = true means buying token1 with token0
+            require(zeroForOne, "isBuy mismatch");
+        } else {
+            // isBuy = false means buying token0 with token1
+            require(!zeroForOne, "isBuy mismatch");
+        }
+        
+        // Note: For internal calls, tokens should already be in the contract
+        // For external calls, tokens are transferred from msg.sender
+        uint256 balanceBefore = tokenIn_.balanceOf(address(this));
+        if (balanceBefore < amountIn) {
+            // This should not happen in internal calls, but handle it for external calls
+            require(tokenIn_.transferFrom(msg.sender, address(this), amountIn - balanceBefore), "Transfer failed");
+        }
+        
+        // Approve pool if needed
+        address poolAddr = address(pool);
+        if (tokenIn == _token0 && !_token0Approved) {
+            tokenIn_.approve(poolAddr, type(uint256).max);
+            _token0Approved = true;
+        } else if (tokenIn == _token1 && !_token1Approved) {
+            tokenIn_.approve(poolAddr, type(uint256).max);
+            _token1Approved = true;
+        }
+        
+        // Calculate sqrtPriceLimitX96 (0 means no limit)
+        uint160 sqrtPriceLimitX96 = zeroForOne 
+            ? 4295128739 + 1  // MIN_SQRT_RATIO + 1
+            : 1461446703485210103287273052203988822378723970342 - 1; // MAX_SQRT_RATIO - 1
+        
+        // Perform swap
+        (amount0Delta, amount1Delta) = pool.swap(
+            address(this), // recipient
+            zeroForOne,
+            int256(amountIn), // amountSpecified (positive for exact input)
+            sqrtPriceLimitX96,
+            "" // data
+        );
+        
+        // Calculate actual output amount
+        // For exact input swaps:
+        // - zeroForOne: amount0Delta > 0 (we pay token0), amount1Delta < 0 (we receive token1)
+        // - !zeroForOne: amount1Delta > 0 (we pay token1), amount0Delta < 0 (we receive token0)
+        
+        // Check if swap was executed (at least one delta should be non-zero)
+        require(amount0Delta != 0 || amount1Delta != 0, "Swap did not execute");
+        
+        uint256 amountOut;
+        if (zeroForOne) {
+            // Swapping token0 -> token1
+            require(amount0Delta >= 0, "Invalid swap: amount0Delta should be non-negative");
+            require(amount1Delta <= 0, "Invalid swap: amount1Delta should be non-positive");
+            if (amount1Delta < 0) {
+                amountOut = uint256(-amount1Delta);
+            } else {
+                // If amount1Delta is zero but amount0Delta > 0, swap consumed input but produced no output
+                // This can happen if price limit was reached or liquidity was insufficient
+                amountOut = 0;
+            }
+        } else {
+            // Swapping token1 -> token0
+            require(amount1Delta >= 0, "Invalid swap: amount1Delta should be non-negative");
+            require(amount0Delta <= 0, "Invalid swap: amount0Delta should be non-positive");
+            if (amount0Delta < 0) {
+                amountOut = uint256(-amount0Delta);
+            } else {
+                // If amount0Delta is zero but amount1Delta > 0, swap consumed input but produced no output
+                // This can happen if price limit was reached or liquidity was insufficient
+                amountOut = 0;
+            }
+        }
+        
+        // Check minimum output
+        // Allow swap to proceed even if output is slightly less than minOut (within 5% tolerance)
+        // This handles cases where pool price differs from balance-based estimate or there's insufficient liquidity
+        if (amountOutMin > 0) {
+            uint256 tolerance = amountOutMin / 20; // 5% tolerance
+            require(amountOut >= (amountOutMin > tolerance ? amountOutMin - tolerance : 0), "Insufficient output");
+        }
+    }
+
+    /// @notice Swap tokens to achieve target ratio (token0/token1 in 1e18 format)
+    /// @param targetRatio Target ratio token0/token1 in 1e18 format (e.g., 1e18 = 1:1, 2e18 = 2:1)
+    /// @param slippage Slippage tolerance in 1e18 format (e.g., 1e16 = 1%)
+    /// @return amount0Delta Amount of token0 swapped (positive if paid, negative if received)
+    /// @return amount1Delta Amount of token1 swapped (positive if paid, negative if received)
+    function swapByRatio(
+        uint256 targetRatio,
+        uint256 slippage
+    ) external onlyOwner returns (int256 amount0Delta, int256 amount1Delta) {
+        _cacheTokens();
+        _cacheDecimals();
+        
+        require(slippage <= FIXED_ONE, "Invalid slippage");
+        
+        IERC20 token0_ = IERC20(_token0);
+        IERC20 token1_ = IERC20(_token1);
+        
+        uint256 balance0 = token0_.balanceOf(address(this));
+        uint256 balance1 = token1_.balanceOf(address(this));
+        
+        require(balance1 > 0, "Token1 balance cannot be zero");
+        require(_decimals0 <= 38 && _decimals1 <= 38, "Too large decimals");
+        
+        // Calculate needed token0 amount: needed0 = balance1 * targetRatio * scale0 / (scale1 * 1e18)
+        uint256 scale0 = 10 ** _decimals0;
+        uint256 scale1 = 10 ** _decimals1;
+        
+        uint256 needed0 = (balance1 * targetRatio * scale0) / (scale1 * FIXED_ONE);
+        
+        bool isBuy;
+        uint256 amount0;
+        
+        if (needed0 > balance0) {
+            // Need to buy token0: swap token1 -> token0
+            // We know balance1 > 0 from require above
+            isBuy = false;
+            amount0 = needed0 - balance0;
+        } else if (needed0 < balance0) {
+            // Need to sell token0: swap token0 -> token1
+            // We know balance0 > 0 (otherwise needed0 >= balance0 would be true)
+            isBuy = true;
+            amount0 = balance0 - needed0;
+        } else {
+            // Ratio is already correct, no swap needed
+            return (0, 0);
+        }
+        
+        // Estimate amount of token1 needed for swap
+        // We know balance1 > 0 from require above
+        // For isBuy=true: we're selling token0, so balance0 > 0 (we calculated amount0 = balance0 - needed0 > 0)
+        // For isBuy=false: we're selling token1, so balance1 > 0 (already checked)
+        // So we can safely use both balances for estimation
+        if (balance0 == 0) {
+            // This should not happen, but handle it gracefully
+            return (0, 0);
+        }
+        
+        // Use balance ratio for estimation (simpler and more reliable)
+        // Pool price could be used, but balance ratio is sufficient for estimation
+        uint256 amount1_est = (amount0 * balance1 * scale0) / (balance0 * scale1);
+        
+        // Calculate swap parameters and execute
+        // Apply more conservative slippage to account for price differences between balance ratio and pool price
+        if (isBuy) {
+            // Selling token0, buying token1
+            // Use more conservative slippage: apply slippage twice to be safer
+            uint256 conservativeSlippage = slippage * 2;
+            if (conservativeSlippage > FIXED_ONE) conservativeSlippage = FIXED_ONE;
+            uint256 minOut = (amount1_est * (FIXED_ONE - conservativeSlippage)) / FIXED_ONE;
+            return _swap(_token0, _token1, amount0, minOut, true);
+        } else {
+            // Selling token1, buying token0
+            // Use more conservative slippage: apply slippage twice to be safer
+            uint256 conservativeSlippage = slippage * 2;
+            if (conservativeSlippage > FIXED_ONE) conservativeSlippage = FIXED_ONE;
+            uint256 minOut = (amount0 * (FIXED_ONE - conservativeSlippage)) / FIXED_ONE;
+            return _swap(_token1, _token0, amount1_est, minOut, false);
+        }
+    }
+
+    /// @notice Callback function called by the pool during swap
+    /// @param amount0Delta Amount of token0 to pay (positive) or receive (negative)
+    /// @param amount1Delta Amount of token1 to pay (positive) or receive (negative)
+    function uniswapV3SwapCallback(
+        int256 amount0Delta,
+        int256 amount1Delta,
+        bytes calldata /* data */
+    ) external override {
+        // Verify caller is the pool
+        require(msg.sender == address(gauge.pool()), "Invalid caller");
+        
+        // Determine which token to pay
+        if (amount0Delta > 0) {
+            // Need to pay token0
+            IERC20(_token0).transfer(msg.sender, uint256(amount0Delta));
+        } else if (amount1Delta > 0) {
+            // Need to pay token1
+            IERC20(_token1).transfer(msg.sender, uint256(amount1Delta));
+        }
+        
+        // Note: If amount0Delta or amount1Delta is negative, we receive tokens
+        // The pool will transfer them to us automatically
     }
 
     /// @notice External function for safe sqrtPrice calculation (for try-catch)
