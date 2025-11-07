@@ -413,7 +413,11 @@ contract DeployAndTestScript is Script {
         {
             console.log("\n[Step 3] First Rebalance (creating position)...");
             console.log("  TokenId before rebalance:", rebalancer_.currentTokenId());
-            rebalancer_.rebalance(tickLower, tickUpper);
+            uint256 ratio = vm.envOr("TEST_RATIO", uint256(1e18)); // Default 1:1 ratio
+            uint256 slippage = vm.envOr("TEST_SLIPPAGE", uint256(1e16)); // Default 1% slippage
+            console.log("  Ratio (token0/token1):", ratio);
+            console.log("  Slippage:", slippage);
+            rebalancer_.rebalance(tickLower, tickUpper, ratio, slippage);
             uint256 tokenId1 = rebalancer_.currentTokenId();
             require(tokenId1 != 0, "First rebalance failed: tokenId is zero");
             console.log("  TokenId after first rebalance:", tokenId1);
@@ -465,7 +469,11 @@ contract DeployAndTestScript is Script {
             }
             
             // Rebalance will close the first position and create a new one
-            rebalancer_.rebalance(tickLower, tickUpper);
+            uint256 ratio = vm.envOr("TEST_RATIO", uint256(1e18)); // Default 1:1 ratio
+            uint256 slippage = vm.envOr("TEST_SLIPPAGE", uint256(1e16)); // Default 1% slippage
+            console.log("  Ratio (token0/token1):", ratio);
+            console.log("  Slippage:", slippage);
+            rebalancer_.rebalance(tickLower, tickUpper, ratio, slippage);
             
             uint256 tokenId2 = rebalancer_.currentTokenId();
             require(tokenId2 != 0, "Second rebalance failed: tokenId is zero");

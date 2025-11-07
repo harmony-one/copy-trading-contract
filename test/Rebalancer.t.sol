@@ -4,6 +4,7 @@ pragma solidity ^0.8.28;
 import {Test, console} from "forge-std/Test.sol";
 import {Rebalancer} from "../src/Rebalancer.sol";
 import {INonfungiblePositionManager} from "../src/interfaces/INonfungiblePositionManager.sol";
+import {ICLSwapCallback} from "../src/interfaces/ICLSwapCallback.sol";
 
 // Mocks for testing
 contract MockERC20 {
@@ -109,10 +110,17 @@ contract MockNFTManager is INonfungiblePositionManager {
 contract MockPool {
     uint160 public sqrtPriceX96;
     int24 public tick;
+    address public token0;
+    address public token1;
 
     constructor(uint160 _sqrtPriceX96, int24 _tick) {
         sqrtPriceX96 = _sqrtPriceX96;
         tick = _tick;
+    }
+
+    function setTokens(address _token0, address _token1) external {
+        token0 = _token0;
+        token1 = _token1;
     }
 
     function slot0() external view returns (
@@ -124,6 +132,31 @@ contract MockPool {
         bool
     ) {
         return (sqrtPriceX96, tick, 0, 0, 0, true);
+    }
+
+    function swap(
+        address recipient,
+        bool zeroForOne,
+        int256 amountSpecified,
+        uint160 sqrtPriceLimitX96,
+        bytes calldata data
+    ) external returns (int256 amount0, int256 amount1) {
+        // Simple mock implementation: assume 1:1 swap ratio for testing
+        // In real pool, this would be more complex
+        if (zeroForOne) {
+            // Swapping token0 -> token1
+            // amount0Delta is positive (we pay), amount1Delta is negative (we receive)
+            amount0 = amountSpecified;
+            amount1 = -amountSpecified; // Simple 1:1 ratio for testing
+        } else {
+            // Swapping token1 -> token0
+            // amount1Delta is positive (we pay), amount0Delta is negative (we receive)
+            amount1 = amountSpecified;
+            amount0 = -amountSpecified; // Simple 1:1 ratio for testing
+        }
+
+        // Call callback to get tokens from recipient
+        ICLSwapCallback(recipient).uniswapV3SwapCallback(amount0, amount1, data);
     }
 }
 
@@ -143,6 +176,7 @@ contract MockGauge {
         // Initialize pool with default price (around tick 0)
         // sqrtPriceX96 = sqrt(1) * 2^96 = 2^96
         pool = new MockPool(79228162514264337593543950336, 0);
+        pool.setTokens(_token0, _token1);
     }
 
     function deposit(uint256 tokenId) external {
@@ -232,8 +266,10 @@ contract RebalancerTest is Test {
 
         int24 tickLower = -1000;
         int24 tickUpper = 1000;
+        uint256 ratio = 1e18; // 1:1 ratio
+        uint256 slippage = 1e16; // 1% slippage
 
-        rebalancer.rebalance(tickLower, tickUpper);
+        rebalancer.rebalance(tickLower, tickUpper, ratio, slippage);
 
         assertEq(rebalancer.currentTokenId(), 1);
         assertTrue(gauge.deposited(1));
@@ -253,8 +289,10 @@ contract RebalancerTest is Test {
 
         int24 tickLower = -1000;
         int24 tickUpper = 1000;
+        uint256 ratio = 1e18; // 1:1 ratio
+        uint256 slippage = 1e16; // 1% slippage
 
-        rebalancer.rebalance(tickLower, tickUpper);
+        rebalancer.rebalance(tickLower, tickUpper, ratio, slippage);
         assertEq(rebalancer.currentTokenId(), 1);
 
         rebalancer.closeAllPositions();
@@ -358,9 +396,11 @@ contract RebalancerTest is Test {
 
         int24 tickLower = -1000;
         int24 tickUpper = 1000;
+        uint256 ratio = 1e18; // 1:1 ratio
+        uint256 slippage = 1e16; // 1% slippage
 
         // First rebalance creates position
-        rebalancer.rebalance(tickLower, tickUpper);
+        rebalancer.rebalance(tickLower, tickUpper, ratio, slippage);
         uint256 tokenId1 = rebalancer.currentTokenId();
         assertEq(tokenId1, 1);
 
@@ -371,7 +411,7 @@ contract RebalancerTest is Test {
         token0.mint(address(rebalancer), amount0 / 10);
         token1.mint(address(rebalancer), amount1 / 10);
 
-        rebalancer.rebalance(tickLower, tickUpper);
+        rebalancer.rebalance(tickLower, tickUpper, ratio, slippage);
         uint256 tokenId2 = rebalancer.currentTokenId();
         
         // Should create a new position (different tokenId)
@@ -388,10 +428,12 @@ contract RebalancerTest is Test {
 
         int24 tickLower = -1000;
         int24 tickUpper = 1000;
+        uint256 ratio = 1e18; // 1:1 ratio
+        uint256 slippage = 1e16; // 1% slippage
 
         // Rebalance should work if price is below range (needs only token0)
         // or should skip if price is inside/above range (needs both tokens)
-        rebalancer.rebalance(tickLower, tickUpper);
+        rebalancer.rebalance(tickLower, tickUpper, ratio, slippage);
         
         // Check that rebalance didn't revert (it might create position or skip)
         // The behavior depends on current price position
@@ -408,10 +450,12 @@ contract RebalancerTest is Test {
 
         int24 tickLower = -1000;
         int24 tickUpper = 1000;
+        uint256 ratio = 1e18; // 1:1 ratio
+        uint256 slippage = 1e16; // 1% slippage
 
         // Rebalance should work if price is above range (needs only token1)
         // or should skip if price is inside/below range (needs both tokens)
-        rebalancer.rebalance(tickLower, tickUpper);
+        rebalancer.rebalance(tickLower, tickUpper, ratio, slippage);
         
         // Check that rebalance didn't revert
         assertTrue(true); // Just check it doesn't revert

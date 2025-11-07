@@ -99,7 +99,7 @@ contract Rebalancer is Ownable, ERC721Holder, ICLSwapCallback {
         require(token1_.transferFrom(msg.sender, address(this), amount1), "transfer token1 failed");
     }
 
-    function rebalance(int24 tickLower, int24 tickUpper) external onlyOwner {
+    function rebalance(int24 tickLower, int24 tickUpper, uint256 ratio, uint256 slippage) external onlyOwner {
         // Cache token addresses and decimals for gas optimization
         _cacheTokens();
         _cacheDecimals();
@@ -108,6 +108,9 @@ contract Rebalancer is Ownable, ERC721Holder, ICLSwapCallback {
         if (currentTokenId != 0) {
             _closeAllPositions();
         }
+
+        // Swap tokens to achieve target ratio before opening new position
+        _swapByRatio(ratio, slippage);
 
         // Use cached addresses instead of view function calls
         IERC20 token0_ = IERC20(_token0);
@@ -120,18 +123,11 @@ contract Rebalancer is Ownable, ERC721Holder, ICLSwapCallback {
             return;
         }
 
-        // Compute optimal amounts using advanced calculation
-        // Pass cached decimals to avoid repeated calls
-        (uint256 amount0, uint256 amount1) = _computeDesiredAmounts(
-            tickLower,
-            tickUpper,
-            balance0,
-            balance1,
-            _decimals0,
-            _decimals1
-        );
+        // Use all available tokens on balance for position creation
+        uint256 amount0 = balance0;
+        uint256 amount1 = balance1;
 
-        // If computed amounts are both zero, skip creating position
+        // If both amounts are zero, skip creating position
         if (amount0 == 0 && amount1 == 0) {
             return;
         }
@@ -382,7 +378,7 @@ contract Rebalancer is Ownable, ERC721Holder, ICLSwapCallback {
         }
     }
 
-    /// @notice Swap tokens to achieve target ratio (token0/token1 in 1e18 format)
+    /// @notice External wrapper for swapByRatio (for testing and external use)
     /// @param targetRatio Target ratio token0/token1 in 1e18 format (e.g., 1e18 = 1:1, 2e18 = 2:1)
     /// @param slippage Slippage tolerance in 1e18 format (e.g., 1e16 = 1%)
     /// @return amount0Delta Amount of token0 swapped (positive if paid, negative if received)
@@ -391,6 +387,18 @@ contract Rebalancer is Ownable, ERC721Holder, ICLSwapCallback {
         uint256 targetRatio,
         uint256 slippage
     ) external onlyOwner returns (int256 amount0Delta, int256 amount1Delta) {
+        return _swapByRatio(targetRatio, slippage);
+    }
+
+    /// @notice Internal swap function to achieve target ratio (token0/token1 in 1e18 format)
+    /// @param targetRatio Target ratio token0/token1 in 1e18 format (e.g., 1e18 = 1:1, 2e18 = 2:1)
+    /// @param slippage Slippage tolerance in 1e18 format (e.g., 1e16 = 1%)
+    /// @return amount0Delta Amount of token0 swapped (positive if paid, negative if received)
+    /// @return amount1Delta Amount of token1 swapped (positive if paid, negative if received)
+    function _swapByRatio(
+        uint256 targetRatio,
+        uint256 slippage
+    ) internal returns (int256 amount0Delta, int256 amount1Delta) {
         _cacheTokens();
         _cacheDecimals();
         
@@ -402,7 +410,16 @@ contract Rebalancer is Ownable, ERC721Holder, ICLSwapCallback {
         uint256 balance0 = token0_.balanceOf(address(this));
         uint256 balance1 = token1_.balanceOf(address(this));
         
-        require(balance1 > 0, "Token1 balance cannot be zero");
+        // If both balances are zero, no swap needed
+        if (balance0 == 0 && balance1 == 0) {
+            return (0, 0);
+        }
+        
+        // If one balance is zero, cannot achieve target ratio, skip swap
+        if (balance0 == 0 || balance1 == 0) {
+            return (0, 0);
+        }
+        
         require(_decimals0 <= 38 && _decimals1 <= 38, "Too large decimals");
         
         // Calculate needed token0 amount: needed0 = balance1 * targetRatio * scale0 / (scale1 * 1e18)
@@ -443,10 +460,25 @@ contract Rebalancer is Ownable, ERC721Holder, ICLSwapCallback {
         // Pool price could be used, but balance ratio is sufficient for estimation
         uint256 amount1_est = (amount0 * balance1 * scale0) / (balance0 * scale1);
         
-        // Calculate swap parameters and execute
-        // Apply more conservative slippage to account for price differences between balance ratio and pool price
+        // Limit swap amount to avoid zeroing out one of the balances
+        // Leave at least 1% of balance to ensure position can be created
+        uint256 minReserve = 100; // 1% in basis points (10000 = 100%)
         if (isBuy) {
             // Selling token0, buying token1
+            // Limit amount0 to leave at least 1% of balance0
+            uint256 maxAmount0 = (balance0 * (10000 - minReserve)) / 10000;
+            if (amount0 > maxAmount0) {
+                amount0 = maxAmount0;
+                // Recalculate amount1_est with limited amount0
+                amount1_est = (amount0 * balance1 * scale0) / (balance0 * scale1);
+            }
+            // Also limit amount1_est to leave at least 1% of balance1
+            uint256 maxAmount1 = (balance1 * (10000 - minReserve)) / 10000;
+            if (amount1_est > maxAmount1) {
+                amount1_est = maxAmount1;
+                // Recalculate amount0 with limited amount1_est
+                amount0 = (amount1_est * balance0 * scale1) / (balance1 * scale0);
+            }
             // Use more conservative slippage: apply slippage twice to be safer
             uint256 conservativeSlippage = slippage * 2;
             if (conservativeSlippage > FIXED_ONE) conservativeSlippage = FIXED_ONE;
@@ -454,6 +486,20 @@ contract Rebalancer is Ownable, ERC721Holder, ICLSwapCallback {
             return _swap(_token0, _token1, amount0, minOut, true);
         } else {
             // Selling token1, buying token0
+            // Limit amount1_est to leave at least 1% of balance1
+            uint256 maxAmount1 = (balance1 * (10000 - minReserve)) / 10000;
+            if (amount1_est > maxAmount1) {
+                amount1_est = maxAmount1;
+                // Recalculate amount0 with limited amount1_est
+                amount0 = (amount1_est * balance0 * scale1) / (balance1 * scale0);
+            }
+            // Also limit amount0 to leave at least 1% of balance0
+            uint256 maxAmount0 = (balance0 * (10000 - minReserve)) / 10000;
+            if (amount0 > maxAmount0) {
+                amount0 = maxAmount0;
+                // Recalculate amount1_est with limited amount0
+                amount1_est = (amount0 * balance1 * scale0) / (balance0 * scale1);
+            }
             // Use more conservative slippage: apply slippage twice to be safer
             uint256 conservativeSlippage = slippage * 2;
             if (conservativeSlippage > FIXED_ONE) conservativeSlippage = FIXED_ONE;
