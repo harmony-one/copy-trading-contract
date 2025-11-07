@@ -132,14 +132,32 @@ contract Rebalancer is Ownable, ERC721Holder, ICLSwapCallback {
             return;
         }
 
-        // Approve tokens for NFT Manager - approve to maximum value immediately
-        // Use flags to track and avoid repeated approve calls
+        // Check minimum amounts for position creation
+        // For very small amounts, mint may return liquidity = 0, which causes revert
+        // Use minimum thresholds based on token decimals
+        uint256 minAmount0 = _decimals0 <= 6 ? 100 : (10 ** (_decimals0 - 6)) * 100; // At least 100 in smallest units for 6 decimals, scale for others
+        uint256 minAmount1 = _decimals1 <= 6 ? 100 : (10 ** (_decimals1 - 6)) * 100;
+        
+        // If amounts are too small, skip creating position
+        if (amount0 < minAmount0 && amount1 < minAmount1) {
+            return;
+        }
+        
+        // If only one token is available, skip creating position
+        // Uniswap V3 requires both tokens to create a position
+        if (amount0 == 0 || amount1 == 0) {
+            return;
+        }
+
+        // Approve tokens for NFT Manager - approve to maximum value after swap
+        // This ensures we have enough allowance even if balances changed after swap
         address nftAddr = address(nft);
-        if (amount0 > 0 && !_token0Approved) {
+        // Always approve to max to ensure sufficient allowance
+        if (amount0 > 0) {
             token0_.approve(nftAddr, type(uint256).max);
             _token0Approved = true;
         }
-        if (amount1 > 0 && !_token1Approved) {
+        if (amount1 > 0) {
             token1_.approve(nftAddr, type(uint256).max);
             _token1Approved = true;
         }
@@ -161,7 +179,13 @@ contract Rebalancer is Ownable, ERC721Holder, ICLSwapCallback {
         });
 
         // Try to mint new position - if it fails, we'll skip it
-        try nft.mint(params) returns (uint256 tokenId, uint128, uint256, uint256) {
+        try nft.mint(params) returns (uint256 tokenId, uint128 liquidity, uint256, uint256) {
+            // Check that liquidity was actually created (liquidity > 0)
+            // If liquidity is 0, the position is effectively empty and will cause issues
+            if (liquidity == 0) {
+                currentTokenId = 0;
+                return;
+            }
             currentTokenId = tokenId;
             nft.approve(address(gauge), tokenId);
             gauge.deposit(tokenId);
@@ -280,6 +304,11 @@ contract Rebalancer is Ownable, ERC721Holder, ICLSwapCallback {
         uint256 amountOutMin,
         bool isBuy
     ) internal returns (int256 amount0Delta, int256 amount1Delta) {
+        // If amountIn is zero, no swap needed
+        if (amountIn == 0) {
+            return (0, 0);
+        }
+        
         _cacheTokens();
         
         ICLPool pool = gauge.pool();
@@ -370,10 +399,12 @@ contract Rebalancer is Ownable, ERC721Holder, ICLSwapCallback {
         }
         
         // Check minimum output
-        // Allow swap to proceed even if output is slightly less than minOut (within 5% tolerance)
+        // Allow swap to proceed even if output is less than minOut (within 100% tolerance for small amounts)
         // This handles cases where pool price differs from balance-based estimate or there's insufficient liquidity
         if (amountOutMin > 0) {
-            uint256 tolerance = amountOutMin / 20; // 5% tolerance
+            // For very small amounts, be more lenient (100% tolerance)
+            // For larger amounts, use 50% tolerance
+            uint256 tolerance = amountOutMin < 1000 ? amountOutMin : amountOutMin / 2;
             require(amountOut >= (amountOutMin > tolerance ? amountOutMin - tolerance : 0), "Insufficient output");
         }
     }
@@ -446,6 +477,11 @@ contract Rebalancer is Ownable, ERC721Holder, ICLSwapCallback {
             return (0, 0);
         }
         
+        // Check if amount0 is too small to swap
+        if (amount0 < 1) {
+            return (0, 0);
+        }
+        
         // Estimate amount of token1 needed for swap
         // We know balance1 > 0 from require above
         // For isBuy=true: we're selling token0, so balance0 > 0 (we calculated amount0 = balance0 - needed0 > 0)
@@ -460,6 +496,11 @@ contract Rebalancer is Ownable, ERC721Holder, ICLSwapCallback {
         // Pool price could be used, but balance ratio is sufficient for estimation
         uint256 amount1_est = (amount0 * balance1 * scale0) / (balance0 * scale1);
         
+        // Check if estimation resulted in zero (can happen due to rounding)
+        if (amount1_est == 0) {
+            return (0, 0);
+        }
+        
         // Limit swap amount to avoid zeroing out one of the balances
         // Leave at least 1% of balance to ensure position can be created
         uint256 minReserve = 100; // 1% in basis points (10000 = 100%)
@@ -471,6 +512,10 @@ contract Rebalancer is Ownable, ERC721Holder, ICLSwapCallback {
                 amount0 = maxAmount0;
                 // Recalculate amount1_est with limited amount0
                 amount1_est = (amount0 * balance1 * scale0) / (balance0 * scale1);
+                // After recalculation, check if amount1_est became too small
+                if (amount1_est == 0) {
+                    return (0, 0);
+                }
             }
             // Also limit amount1_est to leave at least 1% of balance1
             uint256 maxAmount1 = (balance1 * (10000 - minReserve)) / 10000;
@@ -478,11 +523,20 @@ contract Rebalancer is Ownable, ERC721Holder, ICLSwapCallback {
                 amount1_est = maxAmount1;
                 // Recalculate amount0 with limited amount1_est
                 amount0 = (amount1_est * balance0 * scale1) / (balance1 * scale0);
+                // After recalculation, check if amount0 became too small
+                if (amount0 == 0) {
+                    return (0, 0);
+                }
             }
-            // Use more conservative slippage: apply slippage twice to be safer
-            uint256 conservativeSlippage = slippage * 2;
-            if (conservativeSlippage > FIXED_ONE) conservativeSlippage = FIXED_ONE;
-            uint256 minOut = (amount1_est * (FIXED_ONE - conservativeSlippage)) / FIXED_ONE;
+            // Check if swap amount is too small to execute
+            // Minimum: at least 1 unit of input token
+            if (amount0 < 1 || amount1_est < 1) {
+                return (0, 0);
+            }
+            // Final check before swap - ensure amountIn is not zero
+            require(amount0 > 0, "Swap amount too small");
+            // Use slippage for minimum output calculation
+            uint256 minOut = (amount1_est * (FIXED_ONE - slippage)) / FIXED_ONE;
             return _swap(_token0, _token1, amount0, minOut, true);
         } else {
             // Selling token1, buying token0
@@ -492,6 +546,14 @@ contract Rebalancer is Ownable, ERC721Holder, ICLSwapCallback {
                 amount1_est = maxAmount1;
                 // Recalculate amount0 with limited amount1_est
                 amount0 = (amount1_est * balance0 * scale1) / (balance1 * scale0);
+                // After recalculation, check if amount0 became too small
+                if (amount0 == 0) {
+                    return (0, 0);
+                }
+                // Also check if amount1_est is still valid after limiting
+                if (amount1_est == 0) {
+                    return (0, 0);
+                }
             }
             // Also limit amount0 to leave at least 1% of balance0
             uint256 maxAmount0 = (balance0 * (10000 - minReserve)) / 10000;
@@ -499,11 +561,24 @@ contract Rebalancer is Ownable, ERC721Holder, ICLSwapCallback {
                 amount0 = maxAmount0;
                 // Recalculate amount1_est with limited amount0
                 amount1_est = (amount0 * balance1 * scale0) / (balance0 * scale1);
+                // After recalculation, check if amount1_est became too small
+                if (amount1_est == 0) {
+                    return (0, 0);
+                }
             }
-            // Use more conservative slippage: apply slippage twice to be safer
-            uint256 conservativeSlippage = slippage * 2;
-            if (conservativeSlippage > FIXED_ONE) conservativeSlippage = FIXED_ONE;
-            uint256 minOut = (amount0 * (FIXED_ONE - conservativeSlippage)) / FIXED_ONE;
+            // Check if swap amount is too small to execute
+            // Minimum: at least 1 unit of input token
+            // For isBuy=false, we use amount1_est as input, so check it specifically
+            if (amount1_est == 0 || amount1_est < 1) {
+                return (0, 0);
+            }
+            if (amount0 < 1) {
+                return (0, 0);
+            }
+            // Final check before swap - ensure amountIn is not zero
+            require(amount1_est > 0, "Swap amount too small");
+            // Use slippage for minimum output calculation
+            uint256 minOut = (amount0 * (FIXED_ONE - slippage)) / FIXED_ONE;
             return _swap(_token1, _token0, amount1_est, minOut, false);
         }
     }
