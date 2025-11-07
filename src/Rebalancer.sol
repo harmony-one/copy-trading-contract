@@ -27,6 +27,10 @@ contract Rebalancer is Ownable, ERC721Holder, ICLSwapCallback {
 
     uint256 private constant FIXED_ONE = 1e18;
 
+    // Events
+    event SwapResult(int256 amount0Delta, int256 amount1Delta, uint256 balance0, uint256 balance1);
+    event SwapByRatioResult(uint256 targetRatio, uint256 slippage);
+
     constructor(address _nft, address _gauge, address _owner) Ownable(_owner) {
         nft = INonfungiblePositionManager(_nft);
         gauge = ICLGauge(_gauge);
@@ -110,13 +114,15 @@ contract Rebalancer is Ownable, ERC721Holder, ICLSwapCallback {
         }
 
         // Swap tokens to achieve target ratio before opening new position
-        _swapByRatio(ratio, slippage);
-
+        (int256 a0, int256 a1) = _swapByRatio(ratio, slippage);
+        
         // Use cached addresses instead of view function calls
         IERC20 token0_ = IERC20(_token0);
         IERC20 token1_ = IERC20(_token1);
         uint256 balance0 = token0_.balanceOf(address(this));
         uint256 balance1 = token1_.balanceOf(address(this));
+        
+        emit SwapResult(a0, a1, balance0, balance1);
 
         // Skip creating new position if balances are too low
         if (balance0 == 0 && balance1 == 0) {
@@ -418,6 +424,7 @@ contract Rebalancer is Ownable, ERC721Holder, ICLSwapCallback {
         uint256 targetRatio,
         uint256 slippage
     ) external onlyOwner returns (int256 amount0Delta, int256 amount1Delta) {
+        emit SwapByRatioResult(targetRatio, slippage);
         return _swapByRatio(targetRatio, slippage);
     }
 

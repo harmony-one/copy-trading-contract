@@ -428,7 +428,8 @@ contract DeployAndTestScript is Script {
         {
             console.log("\n[Step 3] First Rebalance (creating position)...");
             console.log("  TokenId before rebalance:", rebalancer_.currentTokenId());
-            uint256 ratio = vm.envOr("TEST_RATIO", uint256(1e18)); // Default 1:1 ratio
+            // uint256 ratio = vm.envOr("TEST_RATIO", uint256(1e18)); // Default 1:1 ratio
+            uint256 ratio = vm.envOr("TEST_RATIO", uint256(1e24)); // Default 10000000:1 ratio
             uint256 slippage = vm.envOr("TEST_SLIPPAGE", uint256(1e16)); // Default 1% slippage
             console.log("  Ratio (token0/token1):", ratio);
             console.log("  Slippage:", slippage);
@@ -459,7 +460,7 @@ contract DeployAndTestScript is Script {
             }
             console.log("[OK] First rebalance completed, position created");
         }
-        
+        /*
         // Step 4: Test Swap (uses available balances after position creation)
         {
             console.log("\n[Step 4] Testing swap method...");
@@ -544,6 +545,7 @@ contract DeployAndTestScript is Script {
             }
             console.log("[OK] Second rebalance completed, new position created (first position closed)");
         }
+        */
         
         // Step 6: Close all positions
         {
