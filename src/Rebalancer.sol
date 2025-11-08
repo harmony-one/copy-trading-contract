@@ -9,7 +9,85 @@ import "./interfaces/ICLPool.sol";
 import "./interfaces/ICLSwapCallback.sol";
 import "./interfaces/IERC20.sol";
 
+
+/// @notice FullMath from Uniswap V3 (mulDiv implementation)
+library FullMath {
+    /// @dev Calculates floor(a*b/denominator) with full precision. Throws if result overflows a uint256 or denominator == 0
+    function mulDiv(uint256 a, uint256 b, uint256 denominator) internal pure returns (uint256 result) {
+        unchecked {
+            // 512-bit multiply [prod1 prod0] = a * b
+            // Compute the product mod 2^256 and mod 2^256 - 1, then use
+            // the Chinese Remainder Theorem to reconstruct the 512 bit result.
+            uint256 prod0; // Least significant 256 bits of the product
+            uint256 prod1; // Most significant 256 bits of the product
+            assembly {
+                let mm := mulmod(a, b, not(0))
+                prod0 := mul(a, b)
+                prod1 := sub(sub(mm, prod0), lt(mm, prod0))
+            }
+
+            // Handle non-overflow cases, 256 by 256 division
+            if (prod1 == 0) {
+                require(denominator > 0);
+                assembly {
+                    result := div(prod0, denominator)
+                }
+                return result;
+            }
+
+            require(denominator > prod1);
+
+            ///////////////////////////////////////////////
+            // 512 by 256 division.
+            ///////////////////////////////////////////////
+
+            // Make division exact by subtracting the remainder from [prod1 prod0]
+            uint256 remainder;
+            assembly {
+                remainder := mulmod(a, b, denominator)
+            }
+            assembly {
+                prod1 := sub(prod1, gt(remainder, prod0))
+                prod0 := sub(prod0, remainder)
+            }
+
+            // Factor powers of two out of denominator and compute largest power of two divisor of denominator.
+            uint256 twos = denominator & (~denominator + 1);
+            assembly {
+                denominator := div(denominator, twos)
+            }
+
+            // Divide [prod1 prod0] by twos
+            assembly {
+                prod0 := div(prod0, twos)
+            }
+            assembly {
+                // Shift in bits from prod1 into prod0. For this we need to compute
+                // prod1 * (2^256 / twos)
+                twos := add(div(sub(0, twos), twos), 1)
+            }
+            prod0 |= prod1 * twos;
+
+            // Invert denominator mod 2^256
+            uint256 inv = (3 * denominator) ^ 2;
+            inv *= 2 - denominator * inv; // inverse mod 2^8
+            inv *= 2 - denominator * inv; // inverse mod 2^16
+            inv *= 2 - denominator * inv; // inverse mod 2^32
+            inv *= 2 - denominator * inv; // inverse mod 2^64
+            inv *= 2 - denominator * inv; // inverse mod 2^128
+            inv *= 2 - denominator * inv; // inverse mod 2^256
+
+            // Because the division is now exact we can multiply by the modular inverse of denominator.
+            result = prod0 * inv;
+            return result;
+        }
+    }
+}
+
+
 contract Rebalancer is Ownable, ERC721Holder, ICLSwapCallback {
+    using FullMath for uint256;
+    
     INonfungiblePositionManager public nft;
     ICLGauge public gauge;
     uint256 public currentTokenId;
@@ -26,10 +104,34 @@ contract Rebalancer is Ownable, ERC721Holder, ICLSwapCallback {
     bool private _token1Approved;
 
     uint256 private constant FIXED_ONE = 1e18;
+        uint256 private constant Q96 = 2**96;
+    uint256 private constant Q192 = 2**192;
+
+    // Struct for swap parameters
+    struct SwapParams {
+        address tokenIn;
+        address tokenOut;
+        uint256 amountIn;
+        uint256 amountOutMin;
+        bool isBuy;
+        bool shouldSwap; // false if no swap is needed
+    }
 
     // Events
     event SwapResult(int256 amount0Delta, int256 amount1Delta, uint256 balance0, uint256 balance1);
     event SwapByRatioResult(uint256 targetRatio, uint256 slippage);
+    event SwapParamsCalculated(
+        bool shouldSwap,
+        address tokenIn,
+        address tokenOut,
+        uint256 amountIn,
+        uint256 amountOutMin,
+        bool isBuy,
+        uint256 balance0,
+        uint256 balance1,
+        uint256 currentRatio,
+        uint256 targetRatio
+    );
 
     constructor(address _nft, address _gauge, address _owner) Ownable(_owner) {
         nft = INonfungiblePositionManager(_nft);
@@ -415,6 +517,631 @@ contract Rebalancer is Ownable, ERC721Holder, ICLSwapCallback {
         }
     }
 
+    /// @notice Calculate swap parameters to achieve target ratio using current contract balances (view function)
+    /// @param targetRatio Target ratio token0/token1 in 1e18 format (e.g., 1e18 = 1:1, 2e18 = 2:1)
+    /// @param slippage Slippage tolerance in 1e18 format (e.g., 1e16 = 1%)
+    /// @return params Swap parameters struct
+    function calculateSwapByRatioParamsView(
+        uint256 targetRatio,
+        uint256 slippage
+    ) public view returns (SwapParams memory params) {
+        // Use existing view functions to get token addresses
+        IERC20 token0_ = token0();
+        IERC20 token1_ = token1();
+        
+        address token0Addr = address(token0_);
+        address token1Addr = address(token1_);
+        
+        uint256 balance0 = token0_.balanceOf(address(this));
+        uint256 balance1 = token1_.balanceOf(address(this));
+        
+        // Get decimals using existing view functions
+        uint8 decimals0 = token0Decimals();
+        uint8 decimals1 = token1Decimals();
+        
+        // Get current price from pool for accurate calculation
+        (uint160 sqrtPriceX96, , , , , ) = gauge.pool().slot0();
+        
+        return calculateSwapByRatioParamsWithPrice(
+            targetRatio,
+            slippage,
+            balance0,
+            balance1,
+            decimals0,
+            decimals1,
+            token0Addr,
+            token1Addr,
+            sqrtPriceX96
+        );
+    }
+
+/// @notice Calculate swap parameters to achieve target ratio using pool price (pure)
+    /// @dev sqrtPriceX96 is UniswapV3 sqrt price (Q96) with price = token1/token0 = (sqrtPriceX96^2)/2^192
+    function calculateSwapByRatioParamsWithPrice(
+        uint256 targetRatio,       // token0/token1 in 1e18
+        uint256 slippage,          // in 1e18
+        uint256 balance0,
+        uint256 balance1,
+        uint8 decimals0,
+        uint8 decimals1,
+        address token0Address,
+        address token1Address,
+        uint160 sqrtPriceX96
+    ) public pure returns (SwapParams memory params) {
+        params.shouldSwap = false;
+
+        // Basic guards
+        if (targetRatio == 0 || slippage > FIXED_ONE) return params;
+        if (balance0 == 0 && balance1 == 0) return params;
+        if (balance0 == 0 || balance1 == 0) return params;
+        if (decimals0 > 38 || decimals1 > 38) return params;
+        if (sqrtPriceX96 == 0) return params;
+
+        uint256 scale0 = 10 ** uint256(decimals0);
+        uint256 scale1 = 10 ** uint256(decimals1);
+
+        // currentRatio = (balance0 * scale1 * FIXED_ONE) / (balance1 * scale0)
+        uint256 currentNumer = FullMath.mulDiv(balance0, scale1, 1); // balance0*scale1
+        uint256 currentDenom = FullMath.mulDiv(balance1, scale0, 1); // balance1*scale0
+        if (currentDenom == 0) return params;
+        uint256 currentRatio = FullMath.mulDiv(currentNumer, FIXED_ONE, currentDenom);
+
+        // if already close enough, no swap
+        // use small epsilon to avoid exact equality issues
+        uint256 eps = FIXED_ONE / 1_000_000; // 1e-6 relative tolerance
+        if (currentRatio >= targetRatio - eps && currentRatio <= targetRatio + eps) {
+            return params;
+        }
+
+        // Compute price0Per1 in FIXED_ONE scale:
+        // uniswap price P = token1/token0 = (sqrtP^2)/Q192
+        // price0Per1 = 1/P = Q192 / (sqrtP^2)
+        uint256 sqrtP = uint256(sqrtPriceX96);
+        uint256 denom = sqrtP * sqrtP; // <= 2^192 fits into uint256
+        if (denom == 0) return params;
+        uint256 price0Per1 = FullMath.mulDiv(Q192, FIXED_ONE, denom); // token0 per token1 in FIXED_ONE
+
+        // reserve guard (leave some percent)
+        uint256 minReserveBps = 100; // 1%
+        uint256 maxSpendToken1 = FullMath.mulDiv(balance1, (10000 - minReserveBps), 10000);
+        uint256 maxSpendToken0 = FullMath.mulDiv(balance0, (10000 - minReserveBps), 10000);
+
+        bool needBuyToken0 = currentRatio < targetRatio; // true => spend token1 to get token0
+
+        // prepare common denominator term = price0Per1 * scale1 + targetRatio * scale0
+        // compute price0Per1*scale1 and targetRatio*scale0 safely
+        uint256 termA = FullMath.mulDiv(price0Per1, scale1, 1);      // price0Per1 * S1
+        uint256 termB = FullMath.mulDiv(targetRatio, scale0, 1);     // targetRatio * S0
+        uint256 denomTerm = termA + termB; // always > 0
+
+        // Depending on direction compute numerator and delta1 (token1 delta)
+        uint256 delta1; // amount of token1 (positive) — interpretation depends on direction
+        uint256 delta0; // derived amount of token0
+
+        if (needBuyToken0) {
+            // formula: delta1 = (targetRatio*balance1*S0 - balance0*S1*FIXED_ONE) / (price0Per1*S1 + targetRatio*S0)
+            // compute left = targetRatio * balance1 * S0
+            uint256 left = FullMath.mulDiv(targetRatio, balance1, 1); // targetRatio * balance1
+            left = FullMath.mulDiv(left, scale0, 1);                 // * S0
+
+            // compute right = balance0 * S1 * FIXED_ONE
+            uint256 right = FullMath.mulDiv(balance0, scale1, 1);    // balance0 * S1
+            right = FullMath.mulDiv(right, FIXED_ONE, 1);           // * FIXED_ONE
+
+            if (left <= right) {
+                // target already unreachable in this direction (or very close) — no swap
+                // but we can attempt best-effort: spend maxSpendToken1
+                if (maxSpendToken1 == 0) return params;
+                delta1 = maxSpendToken1;
+                // delta0 = delta1 * price0Per1 / FIXED_ONE
+                delta0 = FullMath.mulDiv(delta1, price0Per1, FIXED_ONE);
+            } else {
+                uint256 numer = left - right;
+                if (denomTerm == 0) return params; // safety
+                delta1 = FullMath.mulDiv(numer, 1, denomTerm);
+                if (delta1 == 0) {
+                    // tiny required amount (rounded to 0) => no swap
+                    return params;
+                }
+                // cap by available
+                if (delta1 > maxSpendToken1) {
+                    // can't reach target; do best-effort (spend max)
+                    delta1 = maxSpendToken1;
+                }
+                // compute delta0
+                delta0 = FullMath.mulDiv(delta1, price0Per1, FIXED_ONE);
+            }
+
+            // final checks
+            if (delta1 == 0 || delta0 == 0) return params;
+
+            // fill params: we spend token1 to buy token0
+            params.shouldSwap = true;
+            params.tokenIn = token1Address;
+            params.tokenOut = token0Address;
+            params.amountIn = delta1; // token1 units
+            params.isBuy = false;      // buying token0 (selling token1), so isBuy = false
+            // amountOutMin = delta0 * (1 - slippage)
+            params.amountOutMin = FullMath.mulDiv(delta0, (FIXED_ONE - slippage), FIXED_ONE);
+            if (params.amountOutMin == 0 && delta0 > 0) params.amountOutMin = 1;
+
+            return params;
+
+        } else {
+            // need to SELL token0 to BUY token1
+            // formula: delta1 = (balance0*S1*FIXED_ONE - targetRatio*balance1*S0) / (price0Per1*S1 + targetRatio*S0)
+            uint256 left = FullMath.mulDiv(balance0, scale1, 1);    // balance0 * S1
+            left = FullMath.mulDiv(left, FIXED_ONE, 1);            // * FIXED_ONE
+
+            uint256 right = FullMath.mulDiv(targetRatio, balance1, 1); // targetRatio * balance1
+            right = FullMath.mulDiv(right, scale0, 1);                 // * S0
+
+            if (left <= right) {
+                // cannot move ratio down by selling token0 (or already close)
+                if (maxSpendToken0 == 0) return params;
+                // Best-effort: sell maxToken0Spend -> compute resulting delta1 = amountOut1
+                delta0 = maxSpendToken0;
+                // delta1 = delta0 * (sqrtP^2) / Q192  -> but we have price0Per1 = Q192/denom => invert
+                // easier: delta1 = delta0 * (1/price0Per1)
+                // 1/price0Per1 (in FIXED_ONE) = denom / Q192 * FIXED_ONE? To avoid invert, we compute:
+                // delta1 = delta0 * (Q192 / denom)^(-1) => delta1 = FullMath.mulDiv(delta0, denom, Q192);
+                // but denom may be big: FullMath handles it.
+                delta1 = FullMath.mulDiv(delta0, denom, Q192);
+            } else {
+                uint256 numer = left - right;
+                if (denomTerm == 0) return params;
+                // note: here delta1 is token1 gained when selling token0 by amount delta0 where delta0 = ?
+                // Derived formula gives delta1 in token1 units (positive).
+                delta1 = FullMath.mulDiv(numer, 1, denomTerm);
+
+                if (delta1 == 0) return params;
+
+                // now delta0 = delta1 * price0Per1 / FIXED_ONE
+                delta0 = FullMath.mulDiv(delta1, price0Per1, FIXED_ONE);
+
+                // cap by available sale (maxSpendToken0)
+                if (delta0 > maxSpendToken0) {
+                    // cap delta0 and recompute delta1 from delta0 via pool price (use exact inverse)
+                    delta0 = maxSpendToken0;
+                    // delta1 = delta0 * denom / Q192  (because token1 per token0 = denom/Q192)
+                    delta1 = FullMath.mulDiv(delta0, denom, Q192);
+                }
+            }
+
+            if (delta0 == 0 || delta1 == 0) return params;
+
+            // fill params: we spend token0 to get token1
+            params.shouldSwap = true;
+            params.tokenIn = token0Address;
+            params.tokenOut = token1Address;
+            params.amountIn = delta0; // token0 units (we sell)
+            params.isBuy = true;      // buying token1 (selling token0), so isBuy = true
+            params.amountOutMin = FullMath.mulDiv(delta1, (FIXED_ONE - slippage), FIXED_ONE);
+            if (params.amountOutMin == 0 && delta1 > 0) params.amountOutMin = 1;
+
+            return params;
+        }
+    }
+
+
+    /// @notice Calculate swap parameters to achieve target ratio using pool price (view function)
+    /// @param targetRatio Target ratio token0/token1 in 1e18 format (e.g., 1e18 = 1:1, 2e18 = 2:1)
+    /// @param slippage Slippage tolerance in 1e18 format (e.g., 1e16 = 1%)
+    /// @param balance0 Current balance of token0
+    /// @param balance1 Current balance of token1
+    /// @param decimals0 Decimals of token0
+    /// @param decimals1 Decimals of token1
+    /// @param token0Address Address of token0
+    /// @param token1Address Address of token1
+    /// @param sqrtPriceX96 Current sqrt price from pool (Q96 format)
+    /// @return params Swap parameters struct
+    function calculateSwapByRatioParamsWithPriceL(
+        uint256 targetRatio,
+        uint256 slippage,
+        uint256 balance0,
+        uint256 balance1,
+        uint8 decimals0,
+        uint8 decimals1,
+        address token0Address,
+        address token1Address,
+        uint160 sqrtPriceX96
+    ) public pure returns (SwapParams memory params) {
+        // Initialize with no swap
+        params.shouldSwap = false;
+        
+        // Validate slippage
+        if (slippage > FIXED_ONE) {
+            return params;
+        }
+        
+        // If both balances are zero, no swap needed
+        if (balance0 == 0 && balance1 == 0) {
+            return params;
+        }
+        
+        // If one balance is zero, cannot achieve target ratio, skip swap
+        if (balance0 == 0 || balance1 == 0) {
+            return params;
+        }
+        
+        if (decimals0 > 38 || decimals1 > 38) {
+            return params;
+        }
+        
+        // Require price to be available - no fallback to balance ratio
+        require(sqrtPriceX96 != 0, "Price not available");
+        
+        uint256 scale0 = 10 ** decimals0;
+        uint256 scale1 = 10 ** decimals1;
+        
+        // Calculate price from sqrtPriceX96
+        // price = (sqrtPriceX96 / 2^96)^2
+        // priceX96 = (sqrtPriceX96^2) / 2^96 (price in Q96 format)
+        uint256 priceX96 = (uint256(sqrtPriceX96) * uint256(sqrtPriceX96)) / (2**96);
+        
+        // Calculate target balances after swap
+        // After swap: (balance0_new * scale1 * 1e18) / (balance1_new * scale0) = targetRatio
+        // Where balance0_new = balance0 + amount0_out, balance1_new = balance1 - amount1_in
+        
+        // For swap token1 -> token0 (buying token0):
+        // amount0_out = amount1_in * price * (scale0 / scale1)
+        // amount0_out = amount1_in * priceX96 * scale0 / (2^96 * scale1)
+        
+        // Target equation:
+        // (balance0 + amount0_out) * scale1 * 1e18 / ((balance1 - amount1_in) * scale0) = targetRatio
+        // (balance0 + amount1_in * priceX96 * scale0 / (2^96 * scale1)) * scale1 * 1e18 / ((balance1 - amount1_in) * scale0) = targetRatio
+        
+        // Solving for amount1_in:
+        // (balance0 * scale1 * 1e18 + amount1_in * priceX96 * scale0 * 1e18 / 2^96) / ((balance1 - amount1_in) * scale0) = targetRatio
+        // balance0 * scale1 * 1e18 + amount1_in * priceX96 * scale0 * 1e18 / 2^96 = targetRatio * (balance1 - amount1_in) * scale0
+        // balance0 * scale1 * 1e18 + amount1_in * priceX96 * scale0 * 1e18 / 2^96 = targetRatio * balance1 * scale0 - targetRatio * amount1_in * scale0
+        // amount1_in * (priceX96 * scale0 * 1e18 / 2^96 + targetRatio * scale0) = targetRatio * balance1 * scale0 - balance0 * scale1 * 1e18
+        // amount1_in = (targetRatio * balance1 * scale0 - balance0 * scale1 * 1e18) / (priceX96 * scale0 * 1e18 / 2^96 + targetRatio * scale0)
+        
+        // For swap token0 -> token1 (selling token0):
+        // amount1_out = amount0_in * (2^96 * scale1) / (priceX96 * scale0)
+        // (balance0 - amount0_in) * scale1 * 1e18 / ((balance1 + amount1_out) * scale0) = targetRatio
+        // Similar calculation but in reverse
+        
+        // Calculate current ratio
+        // Check for division by zero
+        if (balance1 == 0) {
+            return params;
+        }
+        uint256 currentRatio = (balance0 * scale1 * FIXED_ONE) / (balance1 * scale0);
+        
+        bool isBuy;
+        uint256 amountIn;
+        uint256 amountOut;
+        
+        if (currentRatio < targetRatio) {
+            // Need to increase ratio: buy token0 (sell token1)
+            isBuy = false;
+            
+            // Calculate amount1_in needed to achieve target ratio
+            // Using the formula derived above
+            // amount1_in = (targetRatio * balance1 * scale0 - balance0 * scale1 * 1e18) / (priceX96 * scale0 * 1e18 / 2^96 + targetRatio * scale0)
+            
+            // Check if we can achieve target ratio
+            // We need: targetRatio * balance1 * scale0 > balance0 * scale1 * FIXED_ONE
+            // If not, we're already at or above target ratio
+            uint256 targetValue = targetRatio * balance1 * scale0;
+            uint256 currentValue = balance0 * scale1 * FIXED_ONE;
+            if (targetValue <= currentValue) {
+                // Already at or above target ratio
+                return params;
+            }
+            
+            uint256 numerator = targetValue - currentValue;
+            
+            // Calculate denominator: priceX96 * scale0 * 1e18 / 2^96 + targetRatio * scale0
+            // = scale0 * (priceX96 * 1e18 / 2^96 + targetRatio)
+            // To avoid precision loss, multiply numerator by 2^96 first
+            // amountIn = (numerator * 2^96) / (priceX96 * scale0 * 1e18 + targetRatio * scale0 * 2^96)
+            uint256 priceTerm = priceX96 * scale0 * FIXED_ONE;
+            uint256 targetTerm = targetRatio * scale0 * (2**96);
+            
+            // Check for overflow
+            if (targetTerm > type(uint256).max - priceTerm) {
+                return params;
+            }
+            
+            uint256 denominator = priceTerm + targetTerm;
+            
+            if (denominator == 0) {
+                return params;
+            }
+            
+            // If numerator is zero, we're already at target ratio
+            if (numerator == 0) {
+                return params;
+            }
+            
+            // Check if numerator * 2^96 would overflow
+            if (numerator > type(uint256).max / (2**96)) {
+                return params;
+            }
+            
+            // Calculate amountIn with higher precision
+            // amountIn = (numerator * 2^96) / denominator
+            uint256 numeratorScaled = numerator * (2**96);
+            amountIn = numeratorScaled / denominator;
+            
+            // If amountIn is zero due to rounding, we need to ensure we have at least minimum amount
+            // But first, check if the calculation itself is valid (numeratorScaled should be >= denominator for non-zero result)
+            if (amountIn == 0) {
+                // If numeratorScaled < denominator, the result would be zero
+                // In this case, we need to use a minimum amount that would give at least 1 unit of output
+                // amountOut = (amountIn * priceX96 * scale0) / (2**96 * scale1) >= 1
+                // So: amountIn >= (2**96 * scale1) / (priceX96 * scale0)
+                if (priceX96 == 0 || scale0 == 0) {
+                    return params;
+                }
+                uint256 minAmountInForOutput = (2**96 * scale1) / (priceX96 * scale0);
+                if (minAmountInForOutput == 0) {
+                    minAmountInForOutput = 1;
+                }
+                // We can't use more than balance1, and we should use at least the minimum
+                if (minAmountInForOutput > 0 && minAmountInForOutput <= balance1) {
+                    amountIn = minAmountInForOutput;
+                } else {
+                    // If we can't get even 1 unit of output, cannot proceed
+                    return params;
+                }
+            }
+            
+            // Calculate expected amount0_out using pool price
+            amountOut = (amountIn * priceX96 * scale0) / (2**96 * scale1);
+            
+            // If amountOut is still zero, we cannot proceed
+            if (amountOut == 0) {
+                return params;
+            }
+            
+        } else if (currentRatio > targetRatio) {
+            // Need to decrease ratio: sell token0 (buy token1)
+            isBuy = true;
+            
+            // Calculate amount0_in needed to achieve target ratio
+            // After swap: balance0_new = balance0 - amount0_in, balance1_new = balance1 + amount1_out
+            // amount1_out = amount0_in * (2^96 * scale1) / (priceX96 * scale0)
+            // Target: (balance0 - amount0_in) * scale1 * 1e18 / ((balance1 + amount1_out) * scale0) = targetRatio
+            // (balance0 - amount0_in) * scale1 * 1e18 / ((balance1 + amount0_in * 2^96 * scale1 / (priceX96 * scale0)) * scale0) = targetRatio
+            // (balance0 - amount0_in) * scale1 * 1e18 = targetRatio * (balance1 * scale0 + amount0_in * 2^96 * scale1 / priceX96)
+            // balance0 * scale1 * 1e18 - amount0_in * scale1 * 1e18 = targetRatio * balance1 * scale0 + targetRatio * amount0_in * 2^96 * scale1 / priceX96
+            // balance0 * scale1 * 1e18 - targetRatio * balance1 * scale0 = amount0_in * (scale1 * 1e18 + targetRatio * 2^96 * scale1 / priceX96)
+            // amount0_in = (balance0 * scale1 * 1e18 - targetRatio * balance1 * scale0) / (scale1 * 1e18 + targetRatio * 2^96 * scale1 / priceX96)
+            
+            // Check if we can achieve target ratio
+            // We need: balance0 * scale1 * FIXED_ONE > targetRatio * balance1 * scale0
+            // If not, we're already at or below target ratio
+            uint256 currentValue = balance0 * scale1 * FIXED_ONE;
+            uint256 targetValue = targetRatio * balance1 * scale0;
+            if (currentValue <= targetValue) {
+                // Already at or below target ratio
+                return params;
+            }
+            
+            uint256 numerator = currentValue - targetValue;
+            
+            // denominator = scale1 * 1e18 + targetRatio * 2^96 * scale1 / priceX96
+            // = scale1 * (1e18 + targetRatio * 2^96 / priceX96)
+            // To avoid overflow when multiplying by priceX96, we use a different approach:
+            // Calculate denominator_term = targetRatio * 2^96 * scale1 / priceX96
+            // But to avoid precision loss, we multiply numerator by priceX96 first:
+            // amountIn = (numerator * priceX96) / (scale1 * (1e18 * priceX96 + targetRatio * 2^96))
+            
+            // denominator = scale1 * 1e18 + targetRatio * 2^96 * scale1 / priceX96
+            // To avoid precision loss from division, we rearrange:
+            // amountIn = numerator / (scale1 * (1e18 + targetRatio * 2^96 / priceX96))
+            // Multiply numerator and denominator by priceX96 to avoid division in denominator:
+            // amountIn = (numerator * priceX96) / (scale1 * (1e18 * priceX96 + targetRatio * 2^96))
+            
+            // Check for potential overflow in multiplication
+            uint256 priceTerm = FIXED_ONE * priceX96;
+            uint256 targetTerm = targetRatio * 2**96;
+            
+            // Check if priceTerm + targetTerm would overflow
+            if (targetTerm > type(uint256).max - priceTerm) {
+                // Cannot calculate due to overflow - return no swap
+                return params;
+            }
+            
+            uint256 denominator = scale1 * (priceTerm + targetTerm);
+            
+            if (denominator == 0) {
+                return params;
+            }
+            
+            // If numerator is zero, we're already at target ratio
+            if (numerator == 0) {
+                return params;
+            }
+            
+            // Check if numerator * priceX96 would overflow
+            if (numerator > type(uint256).max / priceX96) {
+                // Cannot calculate due to overflow - return no swap
+                return params;
+            }
+            
+            // Calculate amountIn with higher precision
+            amountIn = (numerator * priceX96) / denominator;
+            
+            // If amountIn is zero due to rounding, use a minimum percentage of balance0
+            // This ensures we always perform a swap when ratio needs adjustment
+            if (amountIn == 0 && balance0 > 0) {
+                // Use at least 1% of balance0 for swap
+                amountIn = balance0 / 100;
+                if (amountIn == 0) {
+                    amountIn = 1; // At least 1 unit
+                }
+                // Ensure we don't exceed balance
+                if (amountIn > balance0) {
+                    amountIn = balance0;
+                }
+            }
+            
+            // Calculate expected amount1_out using pool price
+            if (priceX96 == 0) {
+                return params;
+            }
+            amountOut = (amountIn * 2**96 * scale1) / (priceX96 * scale0);
+            
+            // If amountOut is zero, ensure we have at least minimum amountIn and amountOut
+            if (amountOut == 0) {
+                // If amountIn is also zero, use 1% of balance0
+                if (amountIn == 0 && balance0 > 0) {
+                    amountIn = balance0 / 100;
+                    if (amountIn == 0) {
+                        amountIn = 1;
+                    }
+                    amountOut = (amountIn * 2**96 * scale1) / (priceX96 * scale0);
+                }
+                // If amountOut is still zero, set it to 1
+                if (amountOut == 0 && amountIn > 0) {
+                    amountOut = 1;
+                }
+                // If we still don't have valid amounts, cannot proceed
+                if (amountIn == 0 || amountOut == 0) {
+                    return params;
+                }
+            }
+        } else {
+            // Ratio is already correct
+            return params;
+        }
+        
+        // Check if amounts are valid
+        // If amountIn is zero, try to use a minimum percentage of balance
+        // This is a fallback to ensure swap happens even if calculation gives zero
+        if (amountIn == 0) {
+            // Use at least 1% of the appropriate balance for swap
+            if (isBuy && balance0 > 0) {
+                // Selling token0, buying token1
+                amountIn = balance0 / 100; // 1% of balance0
+                if (amountIn == 0) {
+                    amountIn = 1; // At least 1 unit
+                }
+                // Recalculate amountOut with new amountIn
+                amountOut = (amountIn * 2**96 * scale1) / (priceX96 * scale0);
+                if (amountOut == 0) {
+                    amountOut = 1; // At least 1 unit of output
+                }
+            } else if (!isBuy && balance1 > 0) {
+                // Selling token1, buying token0
+                amountIn = balance1 / 100; // 1% of balance1
+                if (amountIn == 0) {
+                    amountIn = 1; // At least 1 unit
+                }
+                // Recalculate amountOut with new amountIn
+                amountOut = (amountIn * priceX96 * scale0) / (2**96 * scale1);
+                if (amountOut == 0) {
+                    amountOut = 1; // At least 1 unit of output
+                }
+            } else {
+                return params;
+            }
+        }
+        
+        // Final check: if amountOut is still zero, set it to 1 if amountIn > 0
+        if (amountOut == 0 && amountIn > 0) {
+            amountOut = 1;
+        }
+        
+        // If we still don't have valid amounts, cannot proceed
+        if (amountIn == 0 || amountOut == 0) {
+            return params;
+        }
+        
+        // Limit swap amount to avoid zeroing out balances
+        uint256 minReserve = 100; // 1% in basis points
+        
+        if (isBuy) {
+            // Selling token0, buying token1
+            uint256 maxAmount0 = (balance0 * (10000 - minReserve)) / 10000;
+            if (amountIn > maxAmount0) {
+                amountIn = maxAmount0;
+                amountOut = (amountIn * 2**96 * scale1) / (priceX96 * scale0);
+                // If amountOut becomes zero after limiting, try to use minimum
+                if (amountOut == 0 && amountIn > 0) {
+                    // Use minimum amountOut = 1
+                    amountOut = 1;
+                    // Recalculate amountIn to match
+                    amountIn = (amountOut * priceX96 * scale0) / (2**96 * scale1);
+                    if (amountIn == 0 || amountIn > maxAmount0) {
+                        return params;
+                    }
+                }
+            }
+            
+            uint256 maxAmount1 = (balance1 * (10000 - minReserve)) / 10000;
+            if (amountOut > maxAmount1) {
+                amountOut = maxAmount1;
+                amountIn = (amountOut * priceX96 * scale0) / (2**96 * scale1);
+                // If amountIn becomes zero after limiting, we cannot proceed
+                if (amountIn == 0) {
+                    return params;
+                }
+            }
+            
+            // Ensure minimum amounts
+            if (amountIn < 1) {
+                return params;
+            }
+            if (amountOut < 1) {
+                return params;
+            }
+            
+            params.shouldSwap = true;
+            params.tokenIn = token0Address;
+            params.tokenOut = token1Address;
+            params.amountIn = amountIn;
+            params.isBuy = true;
+            params.amountOutMin = (amountOut * (FIXED_ONE - slippage)) / FIXED_ONE;
+        } else {
+            // Selling token1, buying token0
+            uint256 maxAmount1 = (balance1 * (10000 - minReserve)) / 10000;
+            if (amountIn > maxAmount1) {
+                amountIn = maxAmount1;
+                amountOut = (amountIn * priceX96 * scale0) / (2**96 * scale1);
+                // If amountOut becomes zero after limiting, we cannot proceed
+                if (amountOut == 0) {
+                    return params;
+                }
+            }
+            
+            // Ensure minimum amounts
+            if (amountIn < 1) {
+                return params;
+            }
+            if (amountOut < 1) {
+                return params;
+            }
+            
+            params.shouldSwap = true;
+            params.tokenIn = token1Address;
+            params.tokenOut = token0Address;
+            params.amountIn = amountIn;
+            params.isBuy = false;
+            
+            // For small swaps, be more conservative
+            if (amountIn < 100) {
+                params.amountOutMin = 0;
+            } else {
+                uint256 effectiveSlippage = slippage * 3;
+                if (effectiveSlippage > FIXED_ONE / 2) {
+                    effectiveSlippage = FIXED_ONE / 2;
+                }
+                params.amountOutMin = (amountOut * (FIXED_ONE - effectiveSlippage)) / FIXED_ONE;
+                if (params.amountOutMin == 0 && amountIn >= 100) {
+                    params.amountOutMin = 1;
+                }
+            }
+        }
+        
+        return params;
+    }
+
     /// @notice External wrapper for swapByRatio (for testing and external use)
     /// @param targetRatio Target ratio token0/token1 in 1e18 format (e.g., 1e18 = 1:1, 2e18 = 2:1)
     /// @param slippage Slippage tolerance in 1e18 format (e.g., 1e16 = 1%)
@@ -440,154 +1167,66 @@ contract Rebalancer is Ownable, ERC721Holder, ICLSwapCallback {
         _cacheTokens();
         _cacheDecimals();
         
-        require(slippage <= FIXED_ONE, "Invalid slippage");
-        
         IERC20 token0_ = IERC20(_token0);
         IERC20 token1_ = IERC20(_token1);
         
         uint256 balance0 = token0_.balanceOf(address(this));
         uint256 balance1 = token1_.balanceOf(address(this));
         
-        // If both balances are zero, no swap needed
-        if (balance0 == 0 && balance1 == 0) {
-            return (0, 0);
-        }
-        
-        // If one balance is zero, cannot achieve target ratio, skip swap
+        // Get current price from pool for accurate calculation
+        (uint160 sqrtPriceX96, , , , , ) = gauge.pool().slot0();
+        // Check if we have balances
         if (balance0 == 0 || balance1 == 0) {
             return (0, 0);
         }
         
-        require(_decimals0 <= 38 && _decimals1 <= 38, "Too large decimals");
+        SwapParams memory params = calculateSwapByRatioParamsWithPrice(
+            targetRatio,
+            slippage,
+            balance0,
+            balance1,
+            _decimals0,
+            _decimals1,
+            _token0,
+            _token1,
+            sqrtPriceX96
+        );
         
-        // Calculate needed token0 amount: needed0 = balance1 * targetRatio * scale0 / (scale1 * 1e18)
+        // Calculate current ratio for logging
         uint256 scale0 = 10 ** _decimals0;
         uint256 scale1 = 10 ** _decimals1;
+        uint256 currentRatio = 0;
+        if (balance1 > 0) {
+            currentRatio = (balance0 * scale1 * FIXED_ONE) / (balance1 * scale0);
+        }
         
-        uint256 needed0 = (balance1 * targetRatio * scale0) / (scale1 * FIXED_ONE);
+        // Emit event for debugging
+        emit SwapParamsCalculated(
+            params.shouldSwap,
+            params.tokenIn,
+            params.tokenOut,
+            params.amountIn,
+            params.amountOutMin,
+            params.isBuy,
+            balance0,
+            balance1,
+            currentRatio,
+            targetRatio
+        );
         
-        bool isBuy;
-        uint256 amount0;
-        
-        if (needed0 > balance0) {
-            // Need to buy token0: swap token1 -> token0
-            // We know balance1 > 0 from require above
-            isBuy = false;
-            amount0 = needed0 - balance0;
-        } else if (needed0 < balance0) {
-            // Need to sell token0: swap token0 -> token1
-            // We know balance0 > 0 (otherwise needed0 >= balance0 would be true)
-            isBuy = true;
-            amount0 = balance0 - needed0;
-        } else {
-            // Ratio is already correct, no swap needed
+        // If no swap is needed, return zero
+        if (!params.shouldSwap) {
+            // Log why swap is not needed
+            // This will help diagnose the issue
             return (0, 0);
         }
         
-        // Check if amount0 is too small to swap
-        if (amount0 < 1) {
-            return (0, 0);
-        }
+        // Validate swap parameters before executing
+        require(params.amountIn > 0, "Invalid swap: amountIn is zero");
+        require(params.tokenIn != address(0) && params.tokenOut != address(0), "Invalid swap: token addresses are zero");
         
-        // Estimate amount of token1 needed for swap
-        // We know balance1 > 0 from require above
-        // For isBuy=true: we're selling token0, so balance0 > 0 (we calculated amount0 = balance0 - needed0 > 0)
-        // For isBuy=false: we're selling token1, so balance1 > 0 (already checked)
-        // So we can safely use both balances for estimation
-        if (balance0 == 0) {
-            // This should not happen, but handle it gracefully
-            return (0, 0);
-        }
-        
-        // Use balance ratio for estimation (simpler and more reliable)
-        // Pool price could be used, but balance ratio is sufficient for estimation
-        uint256 amount1_est = (amount0 * balance1 * scale0) / (balance0 * scale1);
-        
-        // Check if estimation resulted in zero (can happen due to rounding)
-        if (amount1_est == 0) {
-            return (0, 0);
-        }
-        
-        // Limit swap amount to avoid zeroing out one of the balances
-        // Leave at least 1% of balance to ensure position can be created
-        uint256 minReserve = 100; // 1% in basis points (10000 = 100%)
-        if (isBuy) {
-            // Selling token0, buying token1
-            // Limit amount0 to leave at least 1% of balance0
-            uint256 maxAmount0 = (balance0 * (10000 - minReserve)) / 10000;
-            if (amount0 > maxAmount0) {
-                amount0 = maxAmount0;
-                // Recalculate amount1_est with limited amount0
-                amount1_est = (amount0 * balance1 * scale0) / (balance0 * scale1);
-                // After recalculation, check if amount1_est became too small
-                if (amount1_est == 0) {
-                    return (0, 0);
-                }
-            }
-            // Also limit amount1_est to leave at least 1% of balance1
-            uint256 maxAmount1 = (balance1 * (10000 - minReserve)) / 10000;
-            if (amount1_est > maxAmount1) {
-                amount1_est = maxAmount1;
-                // Recalculate amount0 with limited amount1_est
-                amount0 = (amount1_est * balance0 * scale1) / (balance1 * scale0);
-                // After recalculation, check if amount0 became too small
-                if (amount0 == 0) {
-                    return (0, 0);
-                }
-            }
-            // Check if swap amount is too small to execute
-            // Minimum: at least 1 unit of input token
-            if (amount0 < 1 || amount1_est < 1) {
-                return (0, 0);
-            }
-            // Final check before swap - ensure amountIn is not zero
-            require(amount0 > 0, "Swap amount too small");
-            // Use slippage for minimum output calculation
-            uint256 minOut = (amount1_est * (FIXED_ONE - slippage)) / FIXED_ONE;
-            return _swap(_token0, _token1, amount0, minOut, true);
-        } else {
-            // Selling token1, buying token0
-            // Limit amount1_est to leave at least 1% of balance1
-            uint256 maxAmount1 = (balance1 * (10000 - minReserve)) / 10000;
-            if (amount1_est > maxAmount1) {
-                amount1_est = maxAmount1;
-                // Recalculate amount0 with limited amount1_est
-                amount0 = (amount1_est * balance0 * scale1) / (balance1 * scale0);
-                // After recalculation, check if amount0 became too small
-                if (amount0 == 0) {
-                    return (0, 0);
-                }
-                // Also check if amount1_est is still valid after limiting
-                if (amount1_est == 0) {
-                    return (0, 0);
-                }
-            }
-            // Also limit amount0 to leave at least 1% of balance0
-            uint256 maxAmount0 = (balance0 * (10000 - minReserve)) / 10000;
-            if (amount0 > maxAmount0) {
-                amount0 = maxAmount0;
-                // Recalculate amount1_est with limited amount0
-                amount1_est = (amount0 * balance1 * scale0) / (balance0 * scale1);
-                // After recalculation, check if amount1_est became too small
-                if (amount1_est == 0) {
-                    return (0, 0);
-                }
-            }
-            // Check if swap amount is too small to execute
-            // Minimum: at least 1 unit of input token
-            // For isBuy=false, we use amount1_est as input, so check it specifically
-            if (amount1_est == 0 || amount1_est < 1) {
-                return (0, 0);
-            }
-            if (amount0 < 1) {
-                return (0, 0);
-            }
-            // Final check before swap - ensure amountIn is not zero
-            require(amount1_est > 0, "Swap amount too small");
-            // Use slippage for minimum output calculation
-            uint256 minOut = (amount0 * (FIXED_ONE - slippage)) / FIXED_ONE;
-            return _swap(_token1, _token0, amount1_est, minOut, false);
-        }
+        // Execute swap with calculated parameters
+        return _swap(params.tokenIn, params.tokenOut, params.amountIn, params.amountOutMin, params.isBuy);
     }
 
     /// @notice Callback function called by the pool during swap
