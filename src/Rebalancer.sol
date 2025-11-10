@@ -324,7 +324,7 @@ contract Rebalancer is Ownable, ERC721Holder, ICLSwapCallback {
         // - Return NFT to this contract via safeTransferFrom
         // IMPORTANT: gauge.withdraw() does NOT decrease the position's liquidity itself!
         try gauge.withdraw(tokenId) {
-            success = true;
+            // success = true;
         } catch (bytes memory) {
             // success = false;
         }
@@ -384,14 +384,14 @@ contract Rebalancer is Ownable, ERC721Holder, ICLSwapCallback {
     }
 
     function _closeAllPositions() internal {
-        if (currentTokenId != 0) {
-            bool success = _closePositionById(currentTokenId);
+        // if (currentTokenId != 0) {
+        //     bool success = _closePositionById(currentTokenId);
 
-            if (success) {
-                currentTokenId = 0;
-            }
-        }
-        // _closeAllPositionsLegacy();
+        //     if (success) {
+        //         currentTokenId = 0;
+        //     }
+        // }
+        _closeAllPositionsLegacy();
     }
 
     function _closeAllPositionsDebug() internal {
@@ -791,7 +791,7 @@ contract Rebalancer is Ownable, ERC721Holder, ICLSwapCallback {
         // Basic guards
         if (targetRatio == 0 || slippage > FIXED_ONE) return params;
         if (balance0 == 0 && balance1 == 0) return params;
-        if (balance0 == 0 || balance1 == 0) return params;
+        // if (balance0 == 0 || balance1 == 0) return params;
         if (decimals0 > 38 || decimals1 > 38) return params;
         if (sqrtPriceX96 == 0) return params;
 
@@ -1404,7 +1404,7 @@ contract Rebalancer is Ownable, ERC721Holder, ICLSwapCallback {
         // Get current price from pool for accurate calculation
         (uint160 sqrtPriceX96, , , , , ) = gauge.pool().slot0();
         // Check if we have balances
-        if (balance0 == 0 || balance1 == 0) {
+        if (balance0 == 0 && balance1 == 0) {
             return (0, 0);
         }
         
