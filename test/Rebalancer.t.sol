@@ -105,6 +105,10 @@ contract MockNFTManager is INonfungiblePositionManager {
         // Return zero liquidity so tests can pass
         return (0, address(0), address(0), address(0), 0, 0, 0, 0, 0, 0, 0, 0);
     }
+
+    function ownerOf(uint256 tokenId) external view override returns (address) {
+        return address(this);
+    }
 }
 
 contract MockPool {
