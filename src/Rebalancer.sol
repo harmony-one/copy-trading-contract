@@ -774,172 +774,189 @@ contract Rebalancer is Ownable, ERC721Holder, ICLSwapCallback {
     }
 
 /// @notice Calculate swap parameters to achieve target ratio using pool price (pure)
-    /// @dev sqrtPriceX96 is UniswapV3 sqrt price (Q96) with price = token1/token0 = (sqrtPriceX96^2)/2^192
-    function calculateSwapByRatioParamsWithPrice(
-        uint256 targetRatio,       // token0/token1 in 1e18
-        uint256 slippage,          // in 1e18
-        uint256 balance0,
-        uint256 balance1,
-        uint8 decimals0,
-        uint8 decimals1,
-        address token0Address,
-        address token1Address,
-        uint160 sqrtPriceX96
-    ) public pure returns (SwapParams memory params) {
-        params.shouldSwap = false;
+/// @dev sqrtPriceX96 is UniswapV3 sqrt price (Q96) with price = token1/token0 = (sqrtPriceX96^2)/2^192
+function calculateSwapByRatioParamsWithPrice(
+    uint256 targetRatio,       // token0/token1 in 1e18
+    uint256 slippage,          // in 1e18
+    uint256 balance0,
+    uint256 balance1,
+    uint8 decimals0,
+    uint8 decimals1,
+    address token0Address,
+    address token1Address,
+    uint160 sqrtPriceX96
+) public pure returns (SwapParams memory params) {
+    params.shouldSwap = false;
 
-        // Basic guards
-        if (targetRatio == 0 || slippage > FIXED_ONE) return params;
-        if (balance0 == 0 && balance1 == 0) return params;
-        // if (balance0 == 0 || balance1 == 0) return params;
-        if (decimals0 > 38 || decimals1 > 38) return params;
-        if (sqrtPriceX96 == 0) return params;
+    // Basic guards
+    if (targetRatio == 0 || slippage > FIXED_ONE) return params;
+    if (balance0 == 0 && balance1 == 0) return params;
+    if (decimals0 > 38 || decimals1 > 38) return params;
+    if (sqrtPriceX96 == 0) return params;
 
-        uint256 scale0 = 10 ** uint256(decimals0);
-        uint256 scale1 = 10 ** uint256(decimals1);
+    uint256 scale0 = 10 ** uint256(decimals0);
+    uint256 scale1 = 10 ** uint256(decimals1);
 
-        // currentRatio = (balance0 * scale1 * FIXED_ONE) / (balance1 * scale0)
+    // compute currentRatio with support for single-sided balances:
+    // if balance0 == 0 -> ratio = 0
+    // if balance1 == 0 -> ratio = +infinity (represented by uint256.max)
+    uint256 currentRatio;
+    bool bothNonZero = (balance0 > 0 && balance1 > 0);
+    if (!bothNonZero) {
+        if (balance0 == 0 && balance1 > 0) {
+            currentRatio = 0;
+        } else if (balance1 == 0 && balance0 > 0) {
+            currentRatio = type(uint256).max;
+        } else {
+            return params;
+        }
+    } else {
         uint256 currentNumer = FullMath.mulDiv(balance0, scale1, 1); // balance0*scale1
         uint256 currentDenom = FullMath.mulDiv(balance1, scale0, 1); // balance1*scale0
         if (currentDenom == 0) return params;
-        uint256 currentRatio = FullMath.mulDiv(currentNumer, FIXED_ONE, currentDenom);
+        currentRatio = FullMath.mulDiv(currentNumer, FIXED_ONE, currentDenom);
+    }
 
-        // if already close enough, no swap
-        // use small epsilon to avoid exact equality issues
-        uint256 eps = FIXED_ONE / 1_000_000; // 1e-6 relative tolerance
+    // if already close enough, no swap (only when both sides non-zero)
+    if (bothNonZero) {
+        uint256 eps = FIXED_ONE / 1_000_000; // 1e-6 tolerance
         if (currentRatio >= targetRatio - eps && currentRatio <= targetRatio + eps) {
             return params;
         }
+    }
 
-        // Compute price0Per1 in FIXED_ONE scale:
-        // uniswap price P = token1/token0 = (sqrtP^2)/Q192
-        // price0Per1 = 1/P = Q192 / (sqrtP^2)
-        uint256 sqrtP = uint256(sqrtPriceX96);
-        uint256 denom = sqrtP * sqrtP; // <= 2^192 fits into uint256
-        if (denom == 0) return params;
-        uint256 price0Per1 = FullMath.mulDiv(Q192, FIXED_ONE, denom); // token0 per token1 in FIXED_ONE
+    // price0Per1 = token0 per token1 in FIXED_ONE
+    uint256 sqrtP = uint256(sqrtPriceX96);
+    uint256 denom = sqrtP * sqrtP; // <= 2^192 fits into uint256
+    if (denom == 0) return params;
+    uint256 price0Per1 = FullMath.mulDiv(Q192, FIXED_ONE, denom);
 
-        // reserve guard (leave some percent)
-        uint256 minReserveBps = 100; // 1%
-        uint256 maxSpendToken1 = FullMath.mulDiv(balance1, (10000 - minReserveBps), 10000);
-        uint256 maxSpendToken0 = FullMath.mulDiv(balance0, (10000 - minReserveBps), 10000);
+    // reserve guard (leave some percent). reduce default reserve to 0.1% to allow closer conversion.
+    uint256 minReserveBps = 10; // 0.1%
+    // compute "soft" max spend (keeping small reserve) and "hard" max spend (almost entire balance)
+    uint256 softMaxSpendToken1 = FullMath.mulDiv(balance1, (10000 - minReserveBps), 10000);
+    uint256 softMaxSpendToken0 = FullMath.mulDiv(balance0, (10000 - minReserveBps), 10000);
+    // hard max spend is using nearly entire balance (leave 1 unit to be safe if decimals allow)
+    uint256 hardMaxSpendToken1 = balance1 > 1 ? balance1 - 1 : 0;
+    uint256 hardMaxSpendToken0 = balance0 > 1 ? balance0 - 1 : 0;
 
-        bool needBuyToken0 = currentRatio < targetRatio; // true => spend token1 to get token0
+    bool needBuyToken0 = currentRatio < targetRatio; // true => spend token1 to get token0
 
-        // prepare common denominator term = price0Per1 * scale1 + targetRatio * scale0
-        // compute price0Per1*scale1 and targetRatio*scale0 safely
-        uint256 termA = FullMath.mulDiv(price0Per1, scale1, 1);      // price0Per1 * S1
-        uint256 termB = FullMath.mulDiv(targetRatio, scale0, 1);     // targetRatio * S0
-        uint256 denomTerm = termA + termB; // always > 0
+    uint256 termA = FullMath.mulDiv(price0Per1, scale1, 1);      // price0Per1 * S1
+    uint256 termB = FullMath.mulDiv(targetRatio, scale0, 1);     // targetRatio * S0
+    uint256 denomTerm = termA + termB; // >0
 
-        // Depending on direction compute numerator and delta1 (token1 delta)
-        uint256 delta1; // amount of token1 (positive) — interpretation depends on direction
-        uint256 delta0; // derived amount of token0
+    uint256 delta1;
+    uint256 delta0;
 
-        if (needBuyToken0) {
-            // formula: delta1 = (targetRatio*balance1*S0 - balance0*S1*FIXED_ONE) / (price0Per1*S1 + targetRatio*S0)
-            // compute left = targetRatio * balance1 * S0
-            uint256 left = FullMath.mulDiv(targetRatio, balance1, 1); // targetRatio * balance1
-            left = FullMath.mulDiv(left, scale0, 1);                 // * S0
+    if (needBuyToken0) {
+        // delta1 = (targetRatio * balance1 * S0 - balance0 * S1 * FIXED_ONE) / denomTerm
+        uint256 left = FullMath.mulDiv(targetRatio, balance1, 1);
+        left = FullMath.mulDiv(left, scale0, 1);
 
-            // compute right = balance0 * S1 * FIXED_ONE
-            uint256 right = FullMath.mulDiv(balance0, scale1, 1);    // balance0 * S1
-            right = FullMath.mulDiv(right, FIXED_ONE, 1);           // * FIXED_ONE
+        uint256 right = FullMath.mulDiv(balance0, scale1, 1);
+        right = FullMath.mulDiv(right, FIXED_ONE, 1);
 
-            if (left <= right) {
-                // target already unreachable in this direction (or very close) — no swap
-                // but we can attempt best-effort: spend maxSpendToken1
-                if (maxSpendToken1 == 0) return params;
-                delta1 = maxSpendToken1;
-                // delta0 = delta1 * price0Per1 / FIXED_ONE
+        if (left <= right) {
+            // shouldn't typically happen (already >= target), but do best-effort:
+            // try soft max first, then hard max if soft not enough to change ratio
+            if (softMaxSpendToken1 == 0 && hardMaxSpendToken1 == 0) return params;
+            delta1 = softMaxSpendToken1;
+            delta0 = FullMath.mulDiv(delta1, price0Per1, FIXED_ONE);
+            if (delta0 == 0 && hardMaxSpendToken1 > delta1) {
+                delta1 = hardMaxSpendToken1;
                 delta0 = FullMath.mulDiv(delta1, price0Per1, FIXED_ONE);
+            }
+        } else {
+            uint256 numer = left - right;
+            if (denomTerm == 0) return params;
+            // ideal delta1 to hit target exactly
+            uint256 idealDelta1 = FullMath.mulDiv(numer, 1, denomTerm);
+            if (idealDelta1 == 0) return params;
+
+            // if ideal <= softMax -> use ideal
+            if (idealDelta1 <= softMaxSpendToken1) {
+                delta1 = idealDelta1;
             } else {
-                uint256 numer = left - right;
-                if (denomTerm == 0) return params; // safety
-                delta1 = FullMath.mulDiv(numer, 1, denomTerm);
-                if (delta1 == 0) {
-                    // tiny required amount (rounded to 0) => no swap
+                // otherwise try to use softMax to get closer; if not enough, use hardMax (spend almost whole balance)
+                if (softMaxSpendToken1 > 0) {
+                    delta1 = softMaxSpendToken1;
+                } else if (hardMaxSpendToken1 > 0) {
+                    delta1 = hardMaxSpendToken1;
+                } else {
                     return params;
                 }
-                // cap by available
-                if (delta1 > maxSpendToken1) {
-                    // can't reach target; do best-effort (spend max)
-                    delta1 = maxSpendToken1;
-                }
-                // compute delta0
-                delta0 = FullMath.mulDiv(delta1, price0Per1, FIXED_ONE);
             }
-
-            // final checks
-            if (delta1 == 0 || delta0 == 0) return params;
-
-            // fill params: we spend token1 to buy token0
-            params.shouldSwap = true;
-            params.tokenIn = token1Address;
-            params.tokenOut = token0Address;
-            params.amountIn = delta1; // token1 units
-            params.isBuy = false;      // buying token0 (selling token1), so isBuy = false
-            // amountOutMin = delta0 * (1 - slippage)
-            params.amountOutMin = FullMath.mulDiv(delta0, (FIXED_ONE - slippage), FIXED_ONE);
-            if (params.amountOutMin == 0 && delta0 > 0) params.amountOutMin = 1;
-
-            return params;
-
-        } else {
-            // need to SELL token0 to BUY token1
-            // formula: delta1 = (balance0*S1*FIXED_ONE - targetRatio*balance1*S0) / (price0Per1*S1 + targetRatio*S0)
-            uint256 left = FullMath.mulDiv(balance0, scale1, 1);    // balance0 * S1
-            left = FullMath.mulDiv(left, FIXED_ONE, 1);            // * FIXED_ONE
-
-            uint256 right = FullMath.mulDiv(targetRatio, balance1, 1); // targetRatio * balance1
-            right = FullMath.mulDiv(right, scale0, 1);                 // * S0
-
-            if (left <= right) {
-                // cannot move ratio down by selling token0 (or already close)
-                if (maxSpendToken0 == 0) return params;
-                // Best-effort: sell maxToken0Spend -> compute resulting delta1 = amountOut1
-                delta0 = maxSpendToken0;
-                // delta1 = delta0 * (sqrtP^2) / Q192  -> but we have price0Per1 = Q192/denom => invert
-                // easier: delta1 = delta0 * (1/price0Per1)
-                // 1/price0Per1 (in FIXED_ONE) = denom / Q192 * FIXED_ONE? To avoid invert, we compute:
-                // delta1 = delta0 * (Q192 / denom)^(-1) => delta1 = FullMath.mulDiv(delta0, denom, Q192);
-                // but denom may be big: FullMath handles it.
-                delta1 = FullMath.mulDiv(delta0, denom, Q192);
-            } else {
-                uint256 numer = left - right;
-                if (denomTerm == 0) return params;
-                // note: here delta1 is token1 gained when selling token0 by amount delta0 where delta0 = ?
-                // Derived formula gives delta1 in token1 units (positive).
-                delta1 = FullMath.mulDiv(numer, 1, denomTerm);
-
-                if (delta1 == 0) return params;
-
-                // now delta0 = delta1 * price0Per1 / FIXED_ONE
-                delta0 = FullMath.mulDiv(delta1, price0Per1, FIXED_ONE);
-
-                // cap by available sale (maxSpendToken0)
-                if (delta0 > maxSpendToken0) {
-                    // cap delta0 and recompute delta1 from delta0 via pool price (use exact inverse)
-                    delta0 = maxSpendToken0;
-                    // delta1 = delta0 * denom / Q192  (because token1 per token0 = denom/Q192)
-                    delta1 = FullMath.mulDiv(delta0, denom, Q192);
-                }
-            }
-
-            if (delta0 == 0 || delta1 == 0) return params;
-
-            // fill params: we spend token0 to get token1
-            params.shouldSwap = true;
-            params.tokenIn = token0Address;
-            params.tokenOut = token1Address;
-            params.amountIn = delta0; // token0 units (we sell)
-            params.isBuy = true;      // buying token1 (selling token0), so isBuy = true
-            params.amountOutMin = FullMath.mulDiv(delta1, (FIXED_ONE - slippage), FIXED_ONE);
-            if (params.amountOutMin == 0 && delta1 > 0) params.amountOutMin = 1;
-
-            return params;
+            delta0 = FullMath.mulDiv(delta1, price0Per1, FIXED_ONE);
         }
+
+        if (delta1 == 0 || delta0 == 0) return params;
+
+        params.shouldSwap = true;
+        params.tokenIn = token1Address;
+        params.tokenOut = token0Address;
+        params.amountIn = delta1;
+        params.isBuy = false;
+        params.amountOutMin = FullMath.mulDiv(delta0, (FIXED_ONE - slippage), FIXED_ONE);
+        if (params.amountOutMin == 0 && delta0 > 0) params.amountOutMin = 1;
+        return params;
+
+    } else {
+        // sell token0 to buy token1
+        uint256 left = FullMath.mulDiv(balance0, scale1, 1);
+        left = FullMath.mulDiv(left, FIXED_ONE, 1);
+
+        uint256 right = FullMath.mulDiv(targetRatio, balance1, 1);
+        right = FullMath.mulDiv(right, scale0, 1);
+
+        if (left <= right) {
+            // already <= target or cannot move by selling; best-effort sell softMax then hardMax
+            if (softMaxSpendToken0 == 0 && hardMaxSpendToken0 == 0) return params;
+            delta0 = softMaxSpendToken0;
+            delta1 = FullMath.mulDiv(delta0, denom, Q192); // token1 received for delta0
+            if (delta1 == 0 && hardMaxSpendToken0 > delta0) {
+                delta0 = hardMaxSpendToken0;
+                delta1 = FullMath.mulDiv(delta0, denom, Q192);
+            }
+        } else {
+            uint256 numer = left - right;
+            if (denomTerm == 0) return params;
+            uint256 idealDelta1 = FullMath.mulDiv(numer, 1, denomTerm); // token1 that would be gained
+            if (idealDelta1 == 0) return params;
+
+            // compute corresponding delta0 = idealDelta1 * price0Per1 / FIXED_ONE
+            uint256 idealDelta0 = FullMath.mulDiv(idealDelta1, price0Per1, FIXED_ONE);
+
+            if (idealDelta0 <= softMaxSpendToken0) {
+                delta0 = idealDelta0;
+                delta1 = idealDelta1;
+            } else {
+                // if ideal needs more token0 than softMax, try softMax, else hardMax
+                if (softMaxSpendToken0 > 0) {
+                    delta0 = softMaxSpendToken0;
+                } else if (hardMaxSpendToken0 > 0) {
+                    delta0 = hardMaxSpendToken0;
+                } else {
+                    return params;
+                }
+                // recompute delta1 from chosen delta0
+                delta1 = FullMath.mulDiv(delta0, denom, Q192);
+            }
+        }
+
+        if (delta0 == 0 || delta1 == 0) return params;
+
+        params.shouldSwap = true;
+        params.tokenIn = token0Address;
+        params.tokenOut = token1Address;
+        params.amountIn = delta0;
+        params.isBuy = true;
+        params.amountOutMin = FullMath.mulDiv(delta1, (FIXED_ONE - slippage), FIXED_ONE);
+        if (params.amountOutMin == 0 && delta1 > 0) params.amountOutMin = 1;
+        return params;
     }
+}
+
 
 
     /// @notice Calculate swap parameters to achieve target ratio using pool price (view function)

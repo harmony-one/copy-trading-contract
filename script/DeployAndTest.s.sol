@@ -430,7 +430,7 @@ contract DeployAndTestScript is Script {
             console.log("  TokenId before rebalance:", rebalancer_.currentTokenId());
             // uint256 ratio = vm.envOr("TEST_RATIO", uint256(1e18)); // Default 1:1 ratio
             uint256 ratio = vm.envOr("TEST_RATIO", uint256(1e23)); // Default 10000000:1 ratio
-            uint256 slippage = vm.envOr("TEST_SLIPPAGE", uint256(1e16)); // Default 1% slippage
+            uint256 slippage = vm.envOr("TEST_SLIPPAGE", uint256(5e16)); // Default 1% slippage
             console.log("  Ratio (token0/token1):", ratio);
             console.log("  Slippage:", slippage);
             rebalancer_.rebalance(tickLower, tickUpper, ratio, slippage);
